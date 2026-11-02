@@ -34,28 +34,28 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-let pairSock = null;
+const SESSION_DIR = path.join(__dirname, 'dark_session');
+let activeSock = null;
 
-// Pairing Code Route (Anti-Hanging Engine)
+// Pairing Code Handler
 app.get('/pair', async (req, res) => {
     let phone = req.query.phone;
-    if (!phone) return res.status(400).json({ error: 'Number required' });
+    if (!phone) return res.status(400).json({ error: 'දුරකථන අංකය ඇතුළත් කරන්න!' });
     phone = phone.replace(/[^0-9]/g, '');
 
-    const tempDir = path.join(__dirname, 'auth_temp');
-    if (fs.existsSync(tempDir)) {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-    }
-
     try {
-        const { state, saveCreds } = await useMultiFileAuthState(tempDir);
-        const { version } = await fetchLatestBaileysVersion();
-
-        if (pairSock) {
-            try { pairSock.end(); } catch (e) {}
+        if (fs.existsSync(SESSION_DIR)) {
+            fs.rmSync(SESSION_DIR, { recursive: true, force: true });
         }
 
-        pairSock = makeWASocket({
+        const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+        const { version } = await fetchLatestBaileysVersion();
+
+        if (activeSock) {
+            try { activeSock.end(); } catch (e) {}
+        }
+
+        activeSock = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
             auth: {
@@ -63,51 +63,52 @@ app.get('/pair', async (req, res) => {
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
             },
             printQRInTerminal: false,
-            // Logging in හිරවීම වළක්වන desktop identity
-            browser: Browsers.macOS('Chrome'),
+            browser: Browsers.windows('Desktop'),
             syncFullHistory: false,
-            markOnlineOnConnect: true,
+            markOnlineOnConnect: false,
             connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 0,
-            keepAliveIntervalMs: 10000
+            defaultQueryTimeoutMs: 0
         });
 
-        pairSock.ev.on('creds.update', saveCreds);
+        activeSock.ev.on('creds.update', saveCreds);
 
-        // Code එක ඉක්මනින් request කිරීම
         await delay(2000);
-        const code = await pairSock.requestPairingCode(phone);
-        const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
 
-        // WhatsApp එකෙන් Link වූ සැනින් Session එක Mongo වලට save කර Bot එක start වීම
-        pairSock.ev.on('connection.update', async (up) => {
-            const { connection } = up;
+        const rawCode = await activeSock.requestPairingCode(phone);
+        const formatted = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
+        console.log(chalk.cyan(`[PAIRING] Code generated: ${formatted}`));
+
+        // Phone එකෙන් Confirm කළ සැනින් Run වන Listener එක
+        activeSock.ev.on('connection.update', async (update) => {
+            const { connection } = update;
 
             if (connection === 'open') {
-                console.log(chalk.green.bold('[✓] DEVICE LINKED SUCCESSFULLY!'));
-                
+                console.log(chalk.green.bold('[✓] DEVICE LINKED! Saving Session to MongoDB Atlas...'));
+
                 try {
                     if (mongoose.connection.readyState !== 1) {
                         await mongoose.connect(config.MONGODB_URI);
                     }
 
-                    const mongoAuth = await useMongoDBAuthState();
-                    const credsPath = path.join(tempDir, 'creds.json');
-                    
-                    if (fs.existsSync(credsPath)) {
-                        const credsData = JSON.parse(fs.readFileSync(credsPath));
-                        await mongoAuth.saveCreds(credsData);
-                        console.log(chalk.green.bold('[✓] Session stored in MongoDB!'));
+                    const credsFile = path.join(SESSION_DIR, 'creds.json');
+                    if (fs.existsSync(credsFile)) {
+                        const credsData = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
+                        
+                        await mongoose.connection.collection('sessions').updateOne(
+                            { _id: 'creds' },
+                            { $set: { data: JSON.stringify(credsData) } },
+                            { upsert: true }
+                        );
+                        console.log(chalk.green.bold('[✓] Session Synced with MongoDB! Launching Dark Dinu Engine...'));
                     }
 
                     setTimeout(() => {
-                        try { pairSock.end(); } catch (e) {}
-                        fs.rmSync(tempDir, { recursive: true, force: true });
-                        startMainBot();
+                        try { activeSock.end(); } catch (e) {}
+                        launchMainEngine();
                     }, 2000);
 
-                } catch (dbErr) {
-                    console.error('Mongo Save Failed:', dbErr.message);
+                } catch (mongoErr) {
+                    console.error('Mongo Save Failed:', mongoErr.message);
                 }
             }
         });
@@ -115,15 +116,15 @@ app.get('/pair', async (req, res) => {
         return res.json({ code: formatted });
 
     } catch (err) {
-        console.error('Pair Error:', err);
-        return res.status(500).json({ error: err.message });
+        console.error(chalk.red('[PAIR ERROR]:'), err);
+        return res.status(500).json({ error: err.message || 'Pairing error' });
     }
 });
 
 app.listen(port, () => console.log(chalk.green(`[SERVER] Live on Port ${port}`)));
 
-// Main Production Bot Loop
-async function startMainBot() {
+// Main Production Bot Loop (Link වූ පසු ක්‍රියාත්මක වන කොටස)
+async function launchMainEngine() {
     try {
         if (mongoose.connection.readyState !== 1) {
             await mongoose.connect(config.MONGODB_URI);
@@ -136,7 +137,7 @@ async function startMainBot() {
         const { version } = await fetchLatestBaileysVersion();
 
         if (!state.creds || !state.creds.registered) {
-            console.log(chalk.yellow('[INFO] Bot awaiting web pairing...'));
+            console.log(chalk.yellow('[INFO] Bot waiting for web pairing...'));
             return;
         }
 
@@ -148,7 +149,7 @@ async function startMainBot() {
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
             },
             printQRInTerminal: false,
-            browser: Browsers.macOS('Chrome'),
+            browser: Browsers.windows('Desktop'),
             syncFullHistory: false,
             markOnlineOnConnect: true,
             msgRetryCounterCache,
@@ -158,28 +159,27 @@ async function startMainBot() {
 
         sock.ev.on('creds.update', saveCreds);
 
-        sock.ev.on('connection.update', async (up) => {
-            const { connection, lastDisconnect } = up;
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
 
             if (connection === 'close') {
                 const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
                 console.log(chalk.red(`[!] Disconnected. Reconnecting: ${shouldReconnect}`));
                 if (shouldReconnect) {
-                    setTimeout(startMainBot, 3000);
+                    setTimeout(launchMainEngine, 3000);
                 }
             } else if (connection === 'open') {
-                console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS LIVE AND COMMANDS ARE ACTIVE! ⚡\n'));
+                console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS RUNNING AT 100% MAXIMUM SPEED! ⚡\n'));
                 const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
                 await sock.sendMessage(ownerJid, { 
                     text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
                           `🛡️ *Status:* Connected Successfully\n` +
-                          `⚙️ *Prefix:* ${settings.get('prefix') || '.'}\n` +
+                          `🛢️ *Database:* MongoDB Atlas\n` +
                           `👑 *Developer:* 94719845166`
                 }).catch(() => {});
             }
         });
 
-        // Single Point Zero-Lag Command Dispatcher
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (type !== 'notify') return;
             const m = messages[0];
@@ -187,10 +187,9 @@ async function startMainBot() {
             await dispatchCommand(sock, m, config, settings);
         });
 
-    } catch (e) {
-        console.error('Bot Boot Error:', e);
+    } catch (err) {
+        console.error(chalk.red('[ENGINE ERROR]:'), err.message);
     }
 }
 
-// Auto Boot if session exists
-startMainBot();
+launchMainEngine();
