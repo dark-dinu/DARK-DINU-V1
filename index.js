@@ -3,12 +3,10 @@ dns.setDefaultResultOrder('ipv4first');
 
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
-const { 
-    default: makeWASocket, 
-    DisconnectReason, 
-    fetchLatestBaileysVersion, 
-    useMultiFileAuthState,
+const {
+    default: makeWASocket,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
     delay,
     makeCacheableSignalKeyStore,
     Browsers
@@ -26,6 +24,7 @@ const { loadPlugins, dispatchCommand } = require('./lib/handler');
 const app = express();
 const port = process.env.PORT || 8000;
 const msgRetryCounterCache = new NodeCache();
+const logger = pino({ level: 'silent' });
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -34,162 +33,176 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-const SESSION_DIR = path.join(__dirname, 'dark_session');
-let activeSock = null;
+// ───────────── State ─────────────
+let sock = null;
+let sockId = 0;        // used to ignore events from old sockets
+let connected = false;
+let pairBusy = false;
 
-// Pairing Code Handler
-app.get('/pair', async (req, res) => {
-    let phone = req.query.phone;
-    if (!phone) return res.status(400).json({ error: 'දුරකථන අංකය ඇතුළත් කරන්න!' });
-    phone = phone.replace(/[^0-9]/g, '');
-
-    try {
-        if (fs.existsSync(SESSION_DIR)) {
-            fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-        }
-
-        const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-        const { version } = await fetchLatestBaileysVersion();
-
-        if (activeSock) {
-            try { activeSock.end(); } catch (e) {}
-        }
-
-        activeSock = makeWASocket({
-            version,
-            logger: pino({ level: 'silent' }),
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
-            },
-            printQRInTerminal: false,
-            browser: Browsers.windows('Desktop'),
-            syncFullHistory: false,
-            markOnlineOnConnect: false,
-            connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 0
-        });
-
-        activeSock.ev.on('creds.update', saveCreds);
-
-        await delay(2000);
-
-        const rawCode = await activeSock.requestPairingCode(phone);
-        const formatted = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
-        console.log(chalk.cyan(`[PAIRING] Code generated: ${formatted}`));
-
-        // Phone එකෙන් Confirm කළ සැනින් Run වන Listener එක
-        activeSock.ev.on('connection.update', async (update) => {
-            const { connection } = update;
-
-            if (connection === 'open') {
-                console.log(chalk.green.bold('[✓] DEVICE LINKED! Saving Session to MongoDB Atlas...'));
-
-                try {
-                    if (mongoose.connection.readyState !== 1) {
-                        await mongoose.connect(config.MONGODB_URI);
-                    }
-
-                    const credsFile = path.join(SESSION_DIR, 'creds.json');
-                    if (fs.existsSync(credsFile)) {
-                        const credsData = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
-                        
-                        await mongoose.connection.collection('sessions').updateOne(
-                            { _id: 'creds' },
-                            { $set: { data: JSON.stringify(credsData) } },
-                            { upsert: true }
-                        );
-                        console.log(chalk.green.bold('[✓] Session Synced with MongoDB! Launching Dark Dinu Engine...'));
-                    }
-
-                    setTimeout(() => {
-                        try { activeSock.end(); } catch (e) {}
-                        launchMainEngine();
-                    }, 2000);
-
-                } catch (mongoErr) {
-                    console.error('Mongo Save Failed:', mongoErr.message);
-                }
-            }
-        });
-
-        return res.json({ code: formatted });
-
-    } catch (err) {
-        console.error(chalk.red('[PAIR ERROR]:'), err);
-        return res.status(500).json({ error: err.message || 'Pairing error' });
-    }
-});
-
-app.listen(port, () => console.log(chalk.green(`[SERVER] Live on Port ${port}`)));
-
-// Main Production Bot Loop (Link වූ පසු ක්‍රියාත්මක වන කොටස)
-async function launchMainEngine() {
-    try {
-        if (mongoose.connection.readyState !== 1) {
-            await mongoose.connect(config.MONGODB_URI);
-        }
-
-        await settings.initSettings();
-        loadPlugins();
-
-        const { state, saveCreds } = await useMongoDBAuthState();
-        const { version } = await fetchLatestBaileysVersion();
-
-        if (!state.creds || !state.creds.registered) {
-            console.log(chalk.yellow('[INFO] Bot waiting for web pairing...'));
-            return;
-        }
-
-        const sock = makeWASocket({
-            version,
-            logger: pino({ level: 'silent' }),
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
-            },
-            printQRInTerminal: false,
-            browser: Browsers.windows('Desktop'),
-            syncFullHistory: false,
-            markOnlineOnConnect: true,
-            msgRetryCounterCache,
-            connectTimeoutMs: 60000,
-            keepAliveIntervalMs: 25000
-        });
-
-        sock.ev.on('creds.update', saveCreds);
-
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect } = update;
-
-            if (connection === 'close') {
-                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log(chalk.red(`[!] Disconnected. Reconnecting: ${shouldReconnect}`));
-                if (shouldReconnect) {
-                    setTimeout(launchMainEngine, 3000);
-                }
-            } else if (connection === 'open') {
-                console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS RUNNING AT 100% MAXIMUM SPEED! ⚡\n'));
-                const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
-                await sock.sendMessage(ownerJid, { 
-                    text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
-                          `🛡️ *Status:* Connected Successfully\n` +
-                          `🛢️ *Database:* MongoDB Atlas\n` +
-                          `👑 *Developer:* 94719845166`
-                }).catch(() => {});
-            }
-        });
-
-        sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            if (type !== 'notify') return;
-            const m = messages[0];
-            if (!m.message) return;
-            await dispatchCommand(sock, m, config, settings);
-        });
-
-    } catch (err) {
-        console.error(chalk.red('[ENGINE ERROR]:'), err.message);
+async function connectDB() {
+    if (mongoose.connection.readyState !== 1) {
+        await mongoose.connect(config.MONGODB_URI);
     }
 }
 
-launchMainEngine();
+function stopSock() {
+    sockId++;
+    connected = false;
+    if (sock) {
+        try { sock.end(undefined); } catch (e) {}
+        sock = null;
+    }
+}
+
+async function wipeSession() {
+    await connectDB();
+    await mongoose.connection.collection('sessions').deleteMany({});
+}
+
+// ───────────── Core connection ─────────────
+// Single function used for BOTH pairing and normal running.
+// After pairing WhatsApp forces a disconnect (code 515 "restartRequired").
+// We must reconnect with the same auth state - the old code never did this.
+async function startSock({ allowUnregistered = false } = {}) {
+    await connectDB();
+
+    const { state, saveCreds } = await useMongoDBAuthState();
+
+    if (!state.creds.registered && !allowUnregistered) {
+        console.log(chalk.yellow('[INFO] No linked session. Waiting for pairing from the web page...'));
+        return null;
+    }
+
+    stopSock();
+    const id = sockId;
+
+    const { version } = await fetchLatestBaileysVersion();
+
+    const s = makeWASocket({
+        version,
+        logger,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, logger)
+        },
+        printQRInTerminal: false,
+        browser: Browsers.ubuntu('Chrome'),
+        syncFullHistory: false,
+        markOnlineOnConnect: true,
+        msgRetryCounterCache,
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 25000
+    });
+    sock = s;
+
+    s.ev.on('creds.update', saveCreds);
+
+    s.ev.on('connection.update', async (update) => {
+        if (id !== sockId) return; // stale socket
+
+        const { connection, lastDisconnect } = update;
+
+        if (connection === 'open') {
+            connected = true;
+            console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS ONLINE ⚡\n'));
+            const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
+            await s.sendMessage(ownerJid, {
+                text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
+                      `🛡️ *Status:* Connected Successfully\n` +
+                      `🛢️ *Database:* MongoDB Atlas\n` +
+                      `👑 *Developer:* 94719845166`
+            }).catch(() => {});
+        }
+
+        if (connection === 'close') {
+            connected = false;
+            const code = lastDisconnect?.error?.output?.statusCode;
+            console.log(chalk.red(`[!] Connection closed (code: ${code})`));
+
+            if (code === DisconnectReason.loggedOut) {
+                console.log(chalk.red('[!] Logged out. Clearing session.'));
+                await wipeSession().catch(() => {});
+                stopSock();
+                return;
+            }
+
+            // Not linked yet (user never entered the code) -> don't loop
+            if (!state.creds.registered) return;
+
+            // 515 = restart required right after pairing -> reconnect fast
+            await delay(code === DisconnectReason.restartRequired ? 500 : 3000);
+            if (id !== sockId) return;
+            startSock().catch((e) => console.error('[RECONNECT ERROR]:', e.message));
+        }
+    });
+
+    s.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (id !== sockId) return;
+        if (type !== 'notify') return;
+        const m = messages[0];
+        if (!m || !m.message) return;
+        try {
+            await dispatchCommand(s, m, config, settings);
+        } catch (e) {
+            console.error('[CMD ERROR]:', e.message);
+        }
+    });
+
+    return { sock: s, state };
+}
+
+// ───────────── Web API ─────────────
+app.get('/status', (req, res) => {
+    res.json({ connected });
+});
+
+app.get('/pair', async (req, res) => {
+    const phone = String(req.query.phone || '').replace(/[^0-9]/g, '');
+
+    if (phone.length < 8 || phone.length > 15) {
+        return res.status(400).json({ error: 'Please enter a valid number with country code.' });
+    }
+    if (connected) {
+        return res.status(409).json({ error: 'This bot is already linked and online.' });
+    }
+    if (pairBusy) {
+        return res.status(429).json({ error: 'A request is already in progress. Please wait.' });
+    }
+
+    pairBusy = true;
+    try {
+        stopSock();
+        await wipeSession();
+
+        const result = await startSock({ allowUnregistered: true });
+        if (!result) throw new Error('Could not start connection.');
+
+        // give the socket time to open its websocket
+        await delay(3000);
+
+        const raw = await result.sock.requestPairingCode(phone);
+        const formatted = raw?.match(/.{1,4}/g)?.join('-') || raw;
+        console.log(chalk.cyan(`[PAIRING] Code for ${phone}: ${formatted}`));
+
+        return res.json({ code: formatted });
+    } catch (err) {
+        console.error(chalk.red('[PAIR ERROR]:'), err);
+        stopSock();
+        return res.status(500).json({ error: err.message || 'Pairing failed. Try again.' });
+    } finally {
+        pairBusy = false;
+    }
+});
+
+// ───────────── Boot ─────────────
+(async () => {
+    try {
+        await connectDB();
+        await settings.initSettings();
+        loadPlugins();
+        app.listen(port, () => console.log(chalk.green(`[SERVER] Live on port ${port}`)));
+        await startSock();
+    } catch (err) {
+        console.error(chalk.red('[BOOT ERROR]:'), err.message);
+    }
+})();
