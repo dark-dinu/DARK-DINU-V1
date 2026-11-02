@@ -9,20 +9,22 @@ const AuthSchema = new mongoose.Schema({
 const Session = mongoose.models.Session || mongoose.model('Session', AuthSchema);
 
 const useMongoDBAuthState = async () => {
+    const memory = new Map();
+
     const writeData = async (data, id) => {
         try {
-            await Session.findByIdAndUpdate(
-                id,
-                { data: JSON.stringify(data, BufferJSON.replacer) },
-                { upsert: true }
-            );
+            const val = JSON.stringify(data, BufferJSON.replacer);
+            memory.set(id, val);
+            await Session.findByIdAndUpdate(id, { data: val }, { upsert: true });
         } catch (e) {}
     };
 
     const readData = async (id) => {
         try {
+            if (memory.has(id)) return JSON.parse(memory.get(id), BufferJSON.reviver);
             const doc = await Session.findById(id);
             if (!doc) return null;
+            memory.set(id, doc.data);
             return JSON.parse(doc.data, BufferJSON.reviver);
         } catch {
             return null;
@@ -31,6 +33,7 @@ const useMongoDBAuthState = async () => {
 
     const removeData = async (id) => {
         try {
+            memory.delete(id);
             await Session.findByIdAndDelete(id);
         } catch {}
     };
