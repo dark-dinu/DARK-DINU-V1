@@ -3,6 +3,7 @@ const path = require('path');
 const { 
     default: makeWASocket, 
     DisconnectReason, 
+    useMultiFileAuthState,
     fetchLatestBaileysVersion, 
     Browsers,
     delay
@@ -21,68 +22,58 @@ const app = express();
 const port = process.env.PORT || 8000;
 const msgRetryCounterCache = new NodeCache();
 
+let sock = null;
+let isPairingInProgress = false;
+
 app.use(express.json());
-// Public folder එක serve කිරීම
 app.use(express.static(path.join(__dirname, 'public')));
 
-let mainSock = null;
-
-// On-Demand Ultra Fast Pairing Code Route
+// Pairing Code Route (100% Reliable Ubuntu/Chrome Handshake)
 app.get('/pair', async (req, res) => {
-    const phone = req.query.phone;
-    if (!phone) return res.status(400).json({ error: 'Phone number required' });
+    let phone = req.query.phone;
+    if (!phone) return res.status(400).json({ error: 'දුරකථන අංකය අවශ්‍යයි!' });
 
-    const cleanNumber = phone.replace(/[^0-9]/g, '');
+    phone = phone.replace(/[^0-9]/g, '');
 
     try {
-        const { state, saveCreds } = await useMongoDBAuthState();
-        const { version } = await fetchLatestBaileysVersion();
-
-        const pairSocket = makeWASocket({
-            version,
-            logger: pino({ level: 'silent' }),
-            auth: state,
-            printQRInTerminal: false,
-            browser: Browsers.macOS('Desktop')
-        });
-
-        pairSocket.ev.on('creds.update', saveCreds);
-
-        await delay(2000); // Handshake stabilization
-
-        if (!pairSocket.authState.creds.registered) {
-            const rawCode = await pairSocket.requestPairingCode(cleanNumber);
-            const code = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
-            
-            // Background listener: Link වූ පසු Main Bot Socket එක restart කර ගැනීමට
-            pairSocket.ev.on('connection.update', async (up) => {
-                if (up.connection === 'open') {
-                    console.log(chalk.green.bold('[✓] Pairing Completed! Starting Main Bot Service...'));
-                    if (!mainSock) startBotEngine();
-                }
-            });
-
-            return res.json({ code });
-        } else {
-            return res.json({ code: 'ALREADY_PAIRED' });
+        if (!sock) {
+            return res.status(503).json({ error: 'Socket එක සූදානම් වෙමින් පවතී. තත්පර 5කින් නැවත උත්සාහ කරන්න.' });
         }
+
+        if (sock.authState.creds.registered) {
+            return res.json({ code: 'ALREADY_LINKED' });
+        }
+
+        isPairingInProgress = true;
+        
+        // WhatsApp handshake එකට කුඩා විරාමයක් ලබාදීම
+        await delay(1500);
+
+        const code = await sock.requestPairingCode(phone);
+        const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
+
+        console.log(chalk.black.bgCyan.bold(`\n [PAIRING] Code generated for ${phone}: ${formatted} \n`));
+        return res.json({ code: formatted });
+
     } catch (err) {
         console.error(chalk.red('[PAIR ERROR]:'), err.message);
-        return res.status(500).json({ error: 'Pairing failed. Wait 5s and try again.' });
+        isPairingInProgress = false;
+        return res.status(500).json({ error: 'Code එක ලබාගැනීමට නොහැකි විය. Page එක Refresh කර නැවත උත්සාහ කරන්න.' });
     }
 });
 
-// Render Port එක open කිරීම
 app.listen(port, () => {
-    console.log(chalk.green.bold(`[SERVER] Web Interface running at port ${port}`));
+    console.log(chalk.green.bold(`[SERVER] Web Interface running on port ${port}`));
 });
 
-// Main Bot Execution Loop
-async function startBotEngine() {
+// Main Bot Core Engine
+async function startDarkEngine() {
     try {
-        console.log(chalk.cyan('[DATABASE]') + ' Connecting to MongoDB Atlas...');
-        await mongoose.connect(config.MONGODB_URI);
-        console.log(chalk.green.bold('[DATABASE] Atlas Connection Established! ⚡'));
+        if (mongoose.connection.readyState !== 1) {
+            console.log(chalk.cyan('[DATABASE]') + ' Connecting to MongoDB Atlas...');
+            await mongoose.connect(config.MONGODB_URI);
+            console.log(chalk.green.bold('[DATABASE] Atlas Connection Established! ⚡'));
+        }
 
         await settings.initSettings();
         loadPlugins();
@@ -90,25 +81,24 @@ async function startBotEngine() {
         const { state, saveCreds } = await useMongoDBAuthState();
         const { version } = await fetchLatestBaileysVersion();
 
-        if (!state.creds.registered) {
-            console.log(chalk.yellow('[NOTICE] Bot is not paired yet. Waiting for Pairing from Web Interface...'));
-            return;
-        }
+        console.log(chalk.yellow(`[SYSTEM] Starting Baileys socket with WA Web v${version.join('.')}`));
 
-        const sock = makeWASocket({
+        sock = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
             auth: state,
             printQRInTerminal: false,
             msgRetryCounterCache,
-            browser: Browsers.macOS('Desktop'),
+            // Render Server වලට වඩාත්ම ගැළපෙන Browser fingerprint එක
+            browser: Browsers.ubuntu('Chrome'),
             syncFullHistory: false,
             markOnlineOnConnect: true,
             connectTimeoutMs: 60000,
-            keepAliveIntervalMs: 25000
+            defaultQueryTimeoutMs: 0,
+            keepAliveIntervalMs: 25000,
+            generateHighQualityLinkPreview: true
         });
 
-        mainSock = sock;
         sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', async (update) => {
@@ -117,13 +107,33 @@ async function startBotEngine() {
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                console.log(chalk.red(`[!] Connection Closed. Reconnecting: ${shouldReconnect}`));
-                if (shouldReconnect) {
-                    await delay(3000);
-                    startBotEngine();
+
+                console.log(chalk.red(`[!] Connection Closed (Status: ${statusCode}). Reconnecting: ${shouldReconnect}`));
+
+                if (statusCode === DisconnectReason.loggedOut) {
+                    console.log(chalk.red.bold('[!] Session Logged Out. Clearing old session from DB...'));
+                    try {
+                        await mongoose.connection.collection('sessions').deleteMany({});
+                    } catch {}
                 }
+
+                // Pair වෙන අතරතුර connection එක drop වුණොත් තත්පර 3ක් ඉඳලා reconnect වීම
+                await delay(3000);
+                startDarkEngine();
+
             } else if (connection === 'open') {
-                console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS LIVE AND RUNNING AT MAXIMUM SPEED! ⚡'));
+                isPairingInProgress = false;
+                console.log(chalk.green.bold('\n═══════════════════════════════════════════'));
+                console.log(chalk.green.bold(' [✓] DARK DINU V1 CONNECTED SUCCESSFULLY! ⚡'));
+                console.log(chalk.green.bold('═══════════════════════════════════════════\n'));
+
+                const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
+                await sock.sendMessage(ownerJid, { 
+                    text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
+                          `🛡️ *Status:* Connected Successfully\n` +
+                          `🛢️ *Database:* MongoDB Atlas\n` +
+                          `🚀 *Engine:* 2026 Production Ready`
+                }).catch(() => {});
             }
         });
 
@@ -137,9 +147,8 @@ async function startBotEngine() {
     } catch (err) {
         console.error(chalk.red('[BOOT ERROR]:'), err.message);
         await delay(5000);
-        startBotEngine();
+        startDarkEngine();
     }
 }
 
-// Start bot if already paired
-startBotEngine();
+startDarkEngine();
