@@ -3,7 +3,6 @@ const path = require('path');
 const { 
     default: makeWASocket, 
     DisconnectReason, 
-    useMultiFileAuthState,
     fetchLatestBaileysVersion, 
     Browsers,
     delay
@@ -22,57 +21,77 @@ const app = express();
 const port = process.env.PORT || 8000;
 const msgRetryCounterCache = new NodeCache();
 
-let sock = null;
-let isPairingInProgress = false;
-
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Pairing Code Route (100% Reliable Ubuntu/Chrome Handshake)
+// ⚡ On-Demand Instant Pairing Route (කිසිම වෙලාවක "Socket සූදානම් වෙමින් පවතී" Error නොඑයි)
 app.get('/pair', async (req, res) => {
     let phone = req.query.phone;
-    if (!phone) return res.status(400).json({ error: 'දුරකථන අංකය අවශ්‍යයි!' });
+    if (!phone) return res.status(400).json({ error: 'දුරකථන අංකය ඇතුළත් කරන්න!' });
 
     phone = phone.replace(/[^0-9]/g, '');
 
     try {
-        if (!sock) {
-            return res.status(503).json({ error: 'Socket එක සූදානම් වෙමින් පවතී. තත්පර 5කින් නැවත උත්සාහ කරන්න.' });
+        if (mongoose.connection.readyState !== 1) {
+            await mongoose.connect(config.MONGODB_URI);
         }
 
-        if (sock.authState.creds.registered) {
+        const { state, saveCreds } = await useMongoDBAuthState();
+        const { version } = await fetchLatestBaileysVersion();
+
+        // Pairing Code එක ලබාගැනීමට පමණක් සෑදෙන Direct Dedicated Socket එක
+        const pairSock = makeWASocket({
+            version,
+            logger: pino({ level: 'silent' }),
+            auth: state,
+            printQRInTerminal: false,
+            browser: Browsers.ubuntu('Chrome'),
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 0,
+            keepAliveIntervalMs: 15000
+        });
+
+        pairSock.ev.on('creds.update', saveCreds);
+
+        // Handshake එකට කුඩා කාලයක් ලබාදීම
+        await delay(2000);
+
+        if (!pairSock.authState.creds.registered) {
+            const rawCode = await pairSock.requestPairingCode(phone);
+            const formatted = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
+            console.log(chalk.black.bgCyan.bold(`\n [PAIRING] Code generated for ${phone}: ${formatted} \n`));
+
+            // Code එක දුන් පසු Phone එකෙන් Link වුණු සැනින් Bot එක start වීම
+            pairSock.ev.on('connection.update', async (update) => {
+                const { connection } = update;
+                if (connection === 'open') {
+                    console.log(chalk.green.bold('[✓] DEVICE LINKED SUCCESSFULLY! Launching Main Engine...'));
+                    await delay(3000);
+                    startMainBot();
+                }
+            });
+
+            return res.json({ code: formatted });
+        } else {
             return res.json({ code: 'ALREADY_LINKED' });
         }
 
-        isPairingInProgress = true;
-        
-        // WhatsApp handshake එකට කුඩා විරාමයක් ලබාදීම
-        await delay(1500);
-
-        const code = await sock.requestPairingCode(phone);
-        const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
-
-        console.log(chalk.black.bgCyan.bold(`\n [PAIRING] Code generated for ${phone}: ${formatted} \n`));
-        return res.json({ code: formatted });
-
     } catch (err) {
         console.error(chalk.red('[PAIR ERROR]:'), err.message);
-        isPairingInProgress = false;
-        return res.status(500).json({ error: 'Code එක ලබාගැනීමට නොහැකි විය. Page එක Refresh කර නැවත උත්සාහ කරන්න.' });
+        return res.status(500).json({ error: 'Error: ' + err.message });
     }
 });
 
+// Render Port Listener
 app.listen(port, () => {
-    console.log(chalk.green.bold(`[SERVER] Web Interface running on port ${port}`));
+    console.log(chalk.green.bold(`[SERVER] Dark Web UI active on port ${port}`));
 });
 
-// Main Bot Core Engine
-async function startDarkEngine() {
+// Main Bot Core Loop (Link වූ පසු ක්‍රියාත්මක වන කොටස)
+async function startMainBot() {
     try {
         if (mongoose.connection.readyState !== 1) {
-            console.log(chalk.cyan('[DATABASE]') + ' Connecting to MongoDB Atlas...');
             await mongoose.connect(config.MONGODB_URI);
-            console.log(chalk.green.bold('[DATABASE] Atlas Connection Established! ⚡'));
         }
 
         await settings.initSettings();
@@ -81,20 +100,22 @@ async function startDarkEngine() {
         const { state, saveCreds } = await useMongoDBAuthState();
         const { version } = await fetchLatestBaileysVersion();
 
-        console.log(chalk.yellow(`[SYSTEM] Starting Baileys socket with WA Web v${version.join('.')}`));
+        // Device එක link වී නැත්නම් background එකෙන් main bot socket එක run නොකර තබයි (Crash වීම වළක්වයි)
+        if (!state.creds.registered) {
+            console.log(chalk.yellow('[NOTICE] Bot is not paired yet. Please generate Pairing Code from web interface.'));
+            return;
+        }
 
-        sock = makeWASocket({
+        const sock = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
             auth: state,
             printQRInTerminal: false,
             msgRetryCounterCache,
-            // Render Server වලට වඩාත්ම ගැළපෙන Browser fingerprint එක
             browser: Browsers.ubuntu('Chrome'),
             syncFullHistory: false,
             markOnlineOnConnect: true,
             connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 0,
             keepAliveIntervalMs: 25000,
             generateHighQualityLinkPreview: true
         });
@@ -107,33 +128,21 @@ async function startDarkEngine() {
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                console.log(chalk.red(`[!] Main Socket Closed. Status: ${statusCode}. Reconnecting: ${shouldReconnect}`));
 
-                console.log(chalk.red(`[!] Connection Closed (Status: ${statusCode}). Reconnecting: ${shouldReconnect}`));
-
-                if (statusCode === DisconnectReason.loggedOut) {
-                    console.log(chalk.red.bold('[!] Session Logged Out. Clearing old session from DB...'));
+                if (shouldReconnect) {
+                    await delay(3000);
+                    startMainBot();
+                } else {
+                    console.log(chalk.red.bold('[!] Session Logged Out. Clearing DB session...'));
                     try {
                         await mongoose.connection.collection('sessions').deleteMany({});
                     } catch {}
                 }
-
-                // Pair වෙන අතරතුර connection එක drop වුණොත් තත්පර 3ක් ඉඳලා reconnect වීම
-                await delay(3000);
-                startDarkEngine();
-
             } else if (connection === 'open') {
-                isPairingInProgress = false;
-                console.log(chalk.green.bold('\n═══════════════════════════════════════════'));
-                console.log(chalk.green.bold(' [✓] DARK DINU V1 CONNECTED SUCCESSFULLY! ⚡'));
-                console.log(chalk.green.bold('═══════════════════════════════════════════\n'));
-
+                console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS RUNNING AT 100% MAXIMUM SPEED! ⚡\n'));
                 const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
-                await sock.sendMessage(ownerJid, { 
-                    text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
-                          `🛡️ *Status:* Connected Successfully\n` +
-                          `🛢️ *Database:* MongoDB Atlas\n` +
-                          `🚀 *Engine:* 2026 Production Ready`
-                }).catch(() => {});
+                await sock.sendMessage(ownerJid, { text: '⚡ *DARK DINU V1 CONNECTED SUCCESSFULLY* ⚡' }).catch(() => {});
             }
         });
 
@@ -145,10 +154,9 @@ async function startDarkEngine() {
         });
 
     } catch (err) {
-        console.error(chalk.red('[BOOT ERROR]:'), err.message);
-        await delay(5000);
-        startDarkEngine();
+        console.error(chalk.red('[BOT ERROR]:'), err.message);
     }
 }
 
-startDarkEngine();
+// Background auto-starter (කලින් pair කර ඇත්නම් පමණක් auto-start වේ)
+startMainBot();
