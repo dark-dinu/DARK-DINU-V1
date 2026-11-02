@@ -2,11 +2,13 @@ const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
 const { 
     default: makeWASocket, 
     DisconnectReason, 
     fetchLatestBaileysVersion, 
-    Browsers,
+    useMultiFileAuthState,
     delay,
     makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
@@ -18,65 +20,31 @@ const NodeCache = require('node-cache');
 const config = require('./config');
 const { useMongoDBAuthState } = require('./database/mongo');
 const settings = require('./database/settings');
-const { commands, loadPlugins, dispatchCommand } = require('./lib/handler');
+const { loadPlugins, dispatchCommand } = require('./lib/handler');
 
 const app = express();
 const port = process.env.PORT || 8000;
 const msgRetryCounterCache = new NodeCache();
 
+app.use(express.json());
+
+// Public Folder එකෙන් index.html එක Root එකටම Serve කිරීම
+app.use(express.static(path.join(__dirname, 'public')));
 app.get('/', (req, res) => {
-    res.send('⚡ DARK DINU V1 IS RUNNING AT 100% MAXIMUM SPEED ⚡');
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(port, () => {
-    console.log(chalk.green.bold(`[SERVER] Port ${port} Active.`));
-});
+// Single Direct Pairing Handler
+app.get('/pair', async (req, res) => {
+    let phone = req.query.phone;
+    if (!phone) return res.status(400).json({ error: 'Number required' });
+    phone = phone.replace(/[^0-9]/g, '');
 
-// Session ID එක Decode කර MongoDB එකට Inject කිරීම
-async function loadSessionFromID() {
-    if (!config.SESSION_ID) {
-        console.log(chalk.red.bold('[ERROR] SESSION_ID එකක් දීලා නෑ! Environment variable එකට SESSION_ID දාන්න.'));
-        return false;
-    }
+    const tempDir = path.join(__dirname, 'temp_' + phone);
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
 
     try {
-        if (mongoose.connection.readyState !== 1) {
-            await mongoose.connect(config.MONGODB_URI);
-        }
-
-        const rawSession = config.SESSION_ID.replace('DARK-DINU;;;', '').trim();
-        const decoded = Buffer.from(rawSession, 'base64').toString('utf-8');
-        const creds = JSON.parse(decoded);
-
-        const mongoAuth = await useMongoDBAuthState();
-        await mongoAuth.saveCreds(creds);
-        console.log(chalk.green.bold('[✓] Session Loaded Successfully from SESSION_ID!'));
-        return true;
-    } catch (e) {
-        console.error(chalk.red('[SESSION LOAD ERROR]:'), e.message);
-        return false;
-    }
-}
-
-async function startDarkDinu() {
-    try {
-        console.log(chalk.cyan('[DATABASE]') + ' Connecting to MongoDB...');
-        if (mongoose.connection.readyState !== 1) {
-            await mongoose.connect(config.MONGODB_URI);
-        }
-        console.log(chalk.green.bold('[DATABASE] Connected! ⚡'));
-
-        await settings.initSettings();
-        loadPlugins();
-
-        const { state, saveCreds } = await useMongoDBAuthState();
-        
-        // Creds නැත්නම් SESSION_ID එකෙන් load කිරීම
-        if (!state.creds || !state.creds.registered) {
-            const loaded = await loadSessionFromID();
-            if (!loaded) return;
-        }
-
+        const { state, saveCreds } = await useMultiFileAuthState(tempDir);
         const { version } = await fetchLatestBaileysVersion();
 
         const sock = makeWASocket({
@@ -87,39 +55,81 @@ async function startDarkDinu() {
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
             },
             printQRInTerminal: false,
-            browser: Browsers.ubuntu('Chrome'),
-            syncFullHistory: false,
-            markOnlineOnConnect: true,
-            msgRetryCounterCache,
-            connectTimeoutMs: 60000,
-            keepAliveIntervalMs: 25000
+            browser: ['Ubuntu', 'Chrome', '20.0.04']
         });
 
         sock.ev.on('creds.update', saveCreds);
 
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect } = update;
+        await delay(2000);
+        const code = await sock.requestPairingCode(phone);
+        const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
 
-            if (connection === 'close') {
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                console.log(chalk.red(`[!] Disconnected (${statusCode}). Reconnecting: ${shouldReconnect}`));
-
-                if (shouldReconnect) {
-                    await delay(3000);
-                    startDarkDinu();
-                } else {
-                    console.log(chalk.red.bold('[!] Session Logged Out! Please get a new SESSION_ID.'));
+        // WhatsApp එකෙන් link වූ සැනින් Session එක Mongo වලට save කර Main Engine එකට මාරු වීම
+        sock.ev.on('connection.update', async (up) => {
+            if (up.connection === 'open') {
+                try {
+                    if (mongoose.connection.readyState !== 1) await mongoose.connect(config.MONGODB_URI);
+                    const mongoAuth = await useMongoDBAuthState();
+                    const credsData = JSON.parse(fs.readFileSync(path.join(tempDir, 'creds.json')));
+                    await mongoAuth.saveCreds(credsData);
+                    console.log(chalk.green.bold('[✓] Logged in & Mongo Saved!'));
+                    try { sock.end(); } catch(e){}
+                    fs.rmSync(tempDir, { recursive: true, force: true });
+                    setTimeout(startMainBot, 2000);
+                } catch(e) {
+                    console.error('Mongo Save Error:', e);
                 }
+            }
+        });
+
+        return res.json({ code: formatted });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+app.listen(port, () => console.log(chalk.green(`[SERVER] Live on ${port}`)));
+
+// Main Bot Engine
+async function startMainBot() {
+    try {
+        if (mongoose.connection.readyState !== 1) await mongoose.connect(config.MONGODB_URI);
+        await settings.initSettings();
+        loadPlugins();
+
+        const { state, saveCreds } = await useMongoDBAuthState();
+        const { version } = await fetchLatestBaileysVersion();
+
+        if (!state.creds || !state.creds.registered) {
+            console.log(chalk.yellow('[INFO] Waiting for pairing from browser...'));
+            return;
+        }
+
+        const sock = makeWASocket({
+            version,
+            logger: pino({ level: 'silent' }),
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+            },
+            printQRInTerminal: false,
+            browser: ['Ubuntu', 'Chrome', '20.0.04'],
+            syncFullHistory: false,
+            markOnlineOnConnect: true,
+            msgRetryCounterCache
+        });
+
+        sock.ev.on('creds.update', saveCreds);
+
+        sock.ev.on('connection.update', async (up) => {
+            const { connection, lastDisconnect } = up;
+            if (connection === 'close') {
+                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+                if (shouldReconnect) setTimeout(startMainBot, 3000);
             } else if (connection === 'open') {
-                console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS RUNNING AT 100% MAXIMUM SPEED! ⚡\n'));
+                console.log(chalk.green.bold('[✓] DARK DINU V1 IS RUNNING AT 100% SPEED! ⚡'));
                 const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
-                await sock.sendMessage(ownerJid, { 
-                    text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
-                          `🛡️ *Status:* Connected (Permanent Engine)\n` +
-                          `🛢️ *Database:* MongoDB Atlas\n` +
-                          `🚀 *Speed:* Zero Lag`
-                }).catch(() => {});
+                await sock.sendMessage(ownerJid, { text: '⚡ *DARK DINU V1 ONLINE* ⚡' }).catch(()=>{});
             }
         });
 
@@ -130,11 +140,9 @@ async function startDarkDinu() {
             await dispatchCommand(sock, m, config, settings);
         });
 
-    } catch (err) {
-        console.error(chalk.red('[FATAL ERROR]:'), err.message);
-        await delay(5000);
-        startDarkDinu();
+    } catch (e) {
+        console.error('Bot Error:', e);
     }
 }
 
-startDarkDinu();
+startMainBot();
