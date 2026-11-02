@@ -1,5 +1,6 @@
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
+dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']);
 
 const express = require('express');
 const path = require('path');
@@ -196,11 +197,27 @@ app.get('/pair', async (req, res) => {
 
 // ───────────── Boot ─────────────
 (async () => {
+    // Web server first so Render never kills the app
+    app.listen(port, () => console.log(chalk.green(`[SERVER] Live on port ${port}`)));
+
+    // Keep retrying until MongoDB connects
+    while (true) {
+        try {
+            await mongoose.connect(config.MONGODB_URI, { serverSelectionTimeoutMS: 15000 });
+            console.log(chalk.green('[DB] MongoDB connected'));
+            break;
+        } catch (err) {
+            console.error(chalk.red('[DB ERROR]:'), err.message, '- retrying in 8s');
+            if (/ENOTFOUND|querySrv/i.test(err.message)) {
+                console.error(chalk.yellow('[HINT] Check MONGODB_URI (cluster hostname) and Atlas Network Access = 0.0.0.0/0'));
+            }
+            await delay(8000);
+        }
+    }
+
     try {
-        await connectDB();
         await settings.initSettings();
         loadPlugins();
-        app.listen(port, () => console.log(chalk.green(`[SERVER] Live on port ${port}`)));
         await startSock();
     } catch (err) {
         console.error(chalk.red('[BOOT ERROR]:'), err.message);
