@@ -6,25 +6,23 @@ const AuthSchema = new mongoose.Schema({
     data: { type: String, required: true }
 }, { versionKey: false });
 
-const Session = mongoose.model('Session', AuthSchema);
+const Session = mongoose.models.Session || mongoose.model('Session', AuthSchema);
 
 const useMongoDBAuthState = async () => {
-    const memoryStore = new Map();
-
     const writeData = async (data, id) => {
-        const serialized = JSON.stringify(data, BufferJSON.replacer);
-        memoryStore.set(id, serialized);
-        await Session.findByIdAndUpdate(id, { data: serialized }, { upsert: true });
+        try {
+            await Session.findByIdAndUpdate(
+                id,
+                { data: JSON.stringify(data, BufferJSON.replacer) },
+                { upsert: true }
+            );
+        } catch (e) {}
     };
 
     const readData = async (id) => {
         try {
-            if (memoryStore.has(id)) {
-                return JSON.parse(memoryStore.get(id), BufferJSON.reviver);
-            }
             const doc = await Session.findById(id);
             if (!doc) return null;
-            memoryStore.set(id, doc.data);
             return JSON.parse(doc.data, BufferJSON.reviver);
         } catch {
             return null;
@@ -32,8 +30,9 @@ const useMongoDBAuthState = async () => {
     };
 
     const removeData = async (id) => {
-        memoryStore.delete(id);
-        await Session.findByIdAndDelete(id).catch(() => {});
+        try {
+            await Session.findByIdAndDelete(id);
+        } catch {}
     };
 
     const creds = (await readData('creds')) || initAuthCreds();
