@@ -2,13 +2,11 @@ const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 
 const express = require('express');
-const path = require('path');
-const fs = require('fs');
 const { 
     default: makeWASocket, 
     DisconnectReason, 
     fetchLatestBaileysVersion, 
-    useMultiFileAuthState,
+    Browsers,
     delay,
     makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
@@ -26,136 +24,60 @@ const app = express();
 const port = process.env.PORT || 8000;
 const msgRetryCounterCache = new NodeCache();
 
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-let pairingSocket = null;
-
-// Clean Temp Folder
-const tempAuthFolder = path.join(__dirname, 'temp_session');
-
-// ⚡ 100% Instant Pairing Route
-app.get('/pair', async (req, res) => {
-    let phone = req.query.phone;
-    if (!phone) return res.status(400).json({ error: 'දුරකථන අංකය ඇතුළත් කරන්න!' });
-
-    phone = phone.replace(/[^0-9]/g, '');
-
-    try {
-        if (fs.existsSync(tempAuthFolder)) {
-            fs.rmSync(tempAuthFolder, { recursive: true, force: true });
-        }
-
-        const { state, saveCreds } = await useMultiFileAuthState(tempAuthFolder);
-        const { version } = await fetchLatestBaileysVersion();
-
-        if (pairingSocket) {
-            try { pairingSocket.end(); } catch (e) {}
-        }
-
-        pairingSocket = makeWASocket({
-            version,
-            logger: pino({ level: 'silent' }),
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
-            },
-            printQRInTerminal: false,
-            // Logging in හිරවීම වළක්වන official desktop fingerprint
-            browser: ['Chrome (Linux)', 'Chrome', '124.0.6367.60'],
-            markOnlineOnConnect: false,
-            generateHighQualityLinkPreview: false,
-            syncFullHistory: false,
-            msgRetryCounterCache,
-            connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 0,
-            keepAliveIntervalMs: 10000
-        });
-
-        pairingSocket.ev.on('creds.update', saveCreds);
-
-        // Pairing Handshake Delay
-        await delay(2000);
-
-        const rawCode = await pairingSocket.requestPairingCode(phone);
-        const formatted = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
-        console.log(chalk.black.bgCyan.bold(`\n [PAIR CODE] Generated: ${formatted} for ${phone} \n`));
-
-        // Background Auto-Save after successful WhatsApp connection
-        pairingSocket.ev.on('connection.update', async (update) => {
-            const { connection } = update;
-
-            if (connection === 'open') {
-                console.log(chalk.green.bold('\n[✓] WHATSAPP LOGGED IN! Syncing to MongoDB Atlas...'));
-                
-                try {
-                    if (mongoose.connection.readyState !== 1) {
-                        await mongoose.connect(config.MONGODB_URI);
-                    }
-                    
-                    const mongoAuth = await useMongoDBAuthState();
-                    const files = fs.readdirSync(tempAuthFolder);
-
-                    // Local temp files සියල්ල එකවර MongoDB එකට sync කිරීම
-                    for (const file of files) {
-                        if (file.endsWith('.json')) {
-                            const content = JSON.parse(fs.readFileSync(path.join(tempAuthFolder, file)));
-                            const keyName = file.replace('.json', '');
-                            if (keyName === 'creds') {
-                                await mongoAuth.saveCreds(content);
-                            } else {
-                                await mongoose.connection.collection('sessions').updateOne(
-                                    { _id: keyName },
-                                    { $set: { data: JSON.stringify(content) } },
-                                    { upsert: true }
-                                );
-                            }
-                        }
-                    }
-
-                    console.log(chalk.green.bold('[✓] MongoDB Sync Complete! Starting Dark Dinu V1...'));
-                    
-                    setTimeout(() => {
-                        try { pairingSocket.end(); } catch (e) {}
-                        fs.rmSync(tempAuthFolder, { recursive: true, force: true });
-                        startBotServer();
-                    }, 3000);
-
-                } catch (saveErr) {
-                    console.error('Mongo Save Error:', saveErr.message);
-                }
-            }
-        });
-
-        return res.json({ code: formatted });
-
-    } catch (err) {
-        console.error(chalk.red('[PAIR ERROR]:'), err);
-        return res.status(500).json({ error: err.message || 'Pairing failed' });
-    }
+app.get('/', (req, res) => {
+    res.send('⚡ DARK DINU V1 IS RUNNING AT 100% MAXIMUM SPEED ⚡');
 });
 
 app.listen(port, () => {
-    console.log(chalk.green.bold(`[SERVER] Live on Port ${port}`));
+    console.log(chalk.green.bold(`[SERVER] Port ${port} Active.`));
 });
 
-// Main Bot Permanent Worker
-async function startBotServer() {
+// Session ID එක Decode කර MongoDB එකට Inject කිරීම
+async function loadSessionFromID() {
+    if (!config.SESSION_ID) {
+        console.log(chalk.red.bold('[ERROR] SESSION_ID එකක් දීලා නෑ! Environment variable එකට SESSION_ID දාන්න.'));
+        return false;
+    }
+
     try {
         if (mongoose.connection.readyState !== 1) {
             await mongoose.connect(config.MONGODB_URI);
         }
 
+        const rawSession = config.SESSION_ID.replace('DARK-DINU;;;', '').trim();
+        const decoded = Buffer.from(rawSession, 'base64').toString('utf-8');
+        const creds = JSON.parse(decoded);
+
+        const mongoAuth = await useMongoDBAuthState();
+        await mongoAuth.saveCreds(creds);
+        console.log(chalk.green.bold('[✓] Session Loaded Successfully from SESSION_ID!'));
+        return true;
+    } catch (e) {
+        console.error(chalk.red('[SESSION LOAD ERROR]:'), e.message);
+        return false;
+    }
+}
+
+async function startDarkDinu() {
+    try {
+        console.log(chalk.cyan('[DATABASE]') + ' Connecting to MongoDB...');
+        if (mongoose.connection.readyState !== 1) {
+            await mongoose.connect(config.MONGODB_URI);
+        }
+        console.log(chalk.green.bold('[DATABASE] Connected! ⚡'));
+
         await settings.initSettings();
         loadPlugins();
 
         const { state, saveCreds } = await useMongoDBAuthState();
-        const { version } = await fetchLatestBaileysVersion();
-
+        
+        // Creds නැත්නම් SESSION_ID එකෙන් load කිරීම
         if (!state.creds || !state.creds.registered) {
-            console.log(chalk.yellow('[INFO] Bot awaiting web pairing...'));
-            return;
+            const loaded = await loadSessionFromID();
+            if (!loaded) return;
         }
+
+        const { version } = await fetchLatestBaileysVersion();
 
         const sock = makeWASocket({
             version,
@@ -165,7 +87,7 @@ async function startBotServer() {
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
             },
             printQRInTerminal: false,
-            browser: ['Chrome (Linux)', 'Chrome', '124.0.6367.60'],
+            browser: Browsers.ubuntu('Chrome'),
             syncFullHistory: false,
             markOnlineOnConnect: true,
             msgRetryCounterCache,
@@ -181,21 +103,23 @@ async function startBotServer() {
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                console.log(chalk.red(`[!] Disconnected. Status: ${statusCode}. Reconnecting: ${shouldReconnect}`));
+                console.log(chalk.red(`[!] Disconnected (${statusCode}). Reconnecting: ${shouldReconnect}`));
 
                 if (shouldReconnect) {
                     await delay(3000);
-                    startBotServer();
+                    startDarkDinu();
                 } else {
-                    console.log(chalk.red.bold('[!] Logged Out. Clearing Session...'));
-                    try {
-                        await mongoose.connection.collection('sessions').deleteMany({});
-                    } catch {}
+                    console.log(chalk.red.bold('[!] Session Logged Out! Please get a new SESSION_ID.'));
                 }
             } else if (connection === 'open') {
                 console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS RUNNING AT 100% MAXIMUM SPEED! ⚡\n'));
                 const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
-                await sock.sendMessage(ownerJid, { text: '⚡ *DARK DINU V1 CONNECTED SUCCESSFULLY* ⚡' }).catch(() => {});
+                await sock.sendMessage(ownerJid, { 
+                    text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
+                          `🛡️ *Status:* Connected (Permanent Engine)\n` +
+                          `🛢️ *Database:* MongoDB Atlas\n` +
+                          `🚀 *Speed:* Zero Lag`
+                }).catch(() => {});
             }
         });
 
@@ -206,10 +130,11 @@ async function startBotServer() {
             await dispatchCommand(sock, m, config, settings);
         });
 
-    } catch (e) {
-        console.error(chalk.red('[MAIN BOT ERROR]:'), e.message);
+    } catch (err) {
+        console.error(chalk.red('[FATAL ERROR]:'), err.message);
+        await delay(5000);
+        startDarkDinu();
     }
 }
 
-// Check on boot
-startBotServer();
+startDarkDinu();
