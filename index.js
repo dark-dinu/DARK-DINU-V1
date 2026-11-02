@@ -9,11 +9,13 @@ const {
     DisconnectReason, 
     fetchLatestBaileysVersion, 
     useMultiFileAuthState,
-    delay
+    delay,
+    makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const mongoose = require('mongoose');
 const chalk = require('chalk');
+const NodeCache = require('node-cache');
 
 const config = require('./config');
 const { useMongoDBAuthState } = require('./database/mongo');
@@ -22,13 +24,17 @@ const { commands, loadPlugins, dispatchCommand } = require('./lib/handler');
 
 const app = express();
 const port = process.env.PORT || 8000;
+const msgRetryCounterCache = new NodeCache();
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-let activePairSocket = null;
+let pairingSocket = null;
 
-// Instant 1-Second Pairing Code Engine (Zero Mongo Delay)
+// Clean Temp Folder
+const tempAuthFolder = path.join(__dirname, 'temp_session');
+
+// ⚡ 100% Instant Pairing Route
 app.get('/pair', async (req, res) => {
     let phone = req.query.phone;
     if (!phone) return res.status(400).json({ error: 'දුරකථන අංකය ඇතුළත් කරන්න!' });
@@ -36,7 +42,6 @@ app.get('/pair', async (req, res) => {
     phone = phone.replace(/[^0-9]/g, '');
 
     try {
-        const tempAuthFolder = path.join(__dirname, 'temp_session');
         if (fs.existsSync(tempAuthFolder)) {
             fs.rmSync(tempAuthFolder, { recursive: true, force: true });
         }
@@ -44,48 +49,80 @@ app.get('/pair', async (req, res) => {
         const { state, saveCreds } = await useMultiFileAuthState(tempAuthFolder);
         const { version } = await fetchLatestBaileysVersion();
 
-        if (activePairSocket) {
-            try { activePairSocket.end(); } catch (e) {}
+        if (pairingSocket) {
+            try { pairingSocket.end(); } catch (e) {}
         }
 
-        activePairSocket = makeWASocket({
+        pairingSocket = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
-            auth: state,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+            },
             printQRInTerminal: false,
-            browser: ['Ubuntu', 'Chrome', '20.0.04'],
+            // Logging in හිරවීම වළක්වන official desktop fingerprint
+            browser: ['Chrome (Linux)', 'Chrome', '124.0.6367.60'],
+            markOnlineOnConnect: false,
+            generateHighQualityLinkPreview: false,
+            syncFullHistory: false,
+            msgRetryCounterCache,
             connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 0
+            defaultQueryTimeoutMs: 0,
+            keepAliveIntervalMs: 10000
         });
 
-        activePairSocket.ev.on('creds.update', saveCreds);
+        pairingSocket.ev.on('creds.update', saveCreds);
 
-        await delay(1500);
+        // Pairing Handshake Delay
+        await delay(2000);
 
-        const rawCode = await activePairSocket.requestPairingCode(phone);
+        const rawCode = await pairingSocket.requestPairingCode(phone);
         const formatted = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
-        console.log(chalk.black.bgCyan.bold(`\n [PAIRING] Code generated for ${phone}: ${formatted} \n`));
+        console.log(chalk.black.bgCyan.bold(`\n [PAIR CODE] Generated: ${formatted} for ${phone} \n`));
 
-        // WhatsApp එකෙන් Link වුණු සැනින් Session එක Mongo වලට save කර Bot එක start කිරීම
-        activePairSocket.ev.on('connection.update', async (update) => {
+        // Background Auto-Save after successful WhatsApp connection
+        pairingSocket.ev.on('connection.update', async (update) => {
             const { connection } = update;
+
             if (connection === 'open') {
-                console.log(chalk.green.bold('[✓] DEVICE LINKED! Transferring Session to MongoDB...'));
+                console.log(chalk.green.bold('\n[✓] WHATSAPP LOGGED IN! Syncing to MongoDB Atlas...'));
                 
                 try {
-                    await connectMongoWithRetry();
+                    if (mongoose.connection.readyState !== 1) {
+                        await mongoose.connect(config.MONGODB_URI);
+                    }
+                    
                     const mongoAuth = await useMongoDBAuthState();
-                    
-                    // Temp creds MongoDB එකට push කිරීම
-                    const credsData = JSON.parse(fs.readFileSync(path.join(tempAuthFolder, 'creds.json')));
-                    await mongoAuth.saveCreds(credsData);
+                    const files = fs.readdirSync(tempAuthFolder);
 
-                    fs.rmSync(tempAuthFolder, { recursive: true, force: true });
-                    console.log(chalk.green.bold('[✓] MongoDB Session Synced! Launching Bot Engine...'));
+                    // Local temp files සියල්ල එකවර MongoDB එකට sync කිරීම
+                    for (const file of files) {
+                        if (file.endsWith('.json')) {
+                            const content = JSON.parse(fs.readFileSync(path.join(tempAuthFolder, file)));
+                            const keyName = file.replace('.json', '');
+                            if (keyName === 'creds') {
+                                await mongoAuth.saveCreds(content);
+                            } else {
+                                await mongoose.connection.collection('sessions').updateOne(
+                                    { _id: keyName },
+                                    { $set: { data: JSON.stringify(content) } },
+                                    { upsert: true }
+                                );
+                            }
+                        }
+                    }
+
+                    console.log(chalk.green.bold('[✓] MongoDB Sync Complete! Starting Dark Dinu V1...'));
                     
-                    setTimeout(() => startMainBot(), 2000);
-                } catch (err) {
-                    console.error('Session transfer failed:', err);
+                    setTimeout(() => {
+                        try { pairingSocket.end(); } catch (e) {}
+                        fs.rmSync(tempAuthFolder, { recursive: true, force: true });
+                        startBotServer();
+                    }, 3000);
+
+                } catch (saveErr) {
+                    console.error('Mongo Save Error:', saveErr.message);
                 }
             }
         });
@@ -94,26 +131,21 @@ app.get('/pair', async (req, res) => {
 
     } catch (err) {
         console.error(chalk.red('[PAIR ERROR]:'), err);
-        return res.status(500).json({ error: 'Pairing failed: ' + (err.message || 'Unknown error') });
+        return res.status(500).json({ error: err.message || 'Pairing failed' });
     }
 });
 
 app.listen(port, () => {
-    console.log(chalk.green.bold(`[SERVER] Dark Web UI active on port ${port}`));
+    console.log(chalk.green.bold(`[SERVER] Live on Port ${port}`));
 });
 
-// Safe MongoDB Connection
-async function connectMongoWithRetry() {
-    if (mongoose.connection.readyState === 1) return;
-    return mongoose.connect(config.MONGODB_URI, {
-        serverSelectionTimeoutMS: 8000
-    });
-}
-
-// Main Production Bot Loop
-async function startMainBot() {
+// Main Bot Permanent Worker
+async function startBotServer() {
     try {
-        await connectMongoWithRetry();
+        if (mongoose.connection.readyState !== 1) {
+            await mongoose.connect(config.MONGODB_URI);
+        }
+
         await settings.initSettings();
         loadPlugins();
 
@@ -121,18 +153,22 @@ async function startMainBot() {
         const { version } = await fetchLatestBaileysVersion();
 
         if (!state.creds || !state.creds.registered) {
-            console.log(chalk.yellow('[NOTICE] Bot is waiting to be paired from web UI...'));
+            console.log(chalk.yellow('[INFO] Bot awaiting web pairing...'));
             return;
         }
 
         const sock = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
-            auth: state,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+            },
             printQRInTerminal: false,
-            browser: ['Ubuntu', 'Chrome', '20.0.04'],
+            browser: ['Chrome (Linux)', 'Chrome', '124.0.6367.60'],
             syncFullHistory: false,
             markOnlineOnConnect: true,
+            msgRetryCounterCache,
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 25000
         });
@@ -145,13 +181,13 @@ async function startMainBot() {
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                console.log(chalk.red(`[!] Socket Disconnected. Status: ${statusCode}. Reconnecting: ${shouldReconnect}`));
+                console.log(chalk.red(`[!] Disconnected. Status: ${statusCode}. Reconnecting: ${shouldReconnect}`));
 
                 if (shouldReconnect) {
                     await delay(3000);
-                    startMainBot();
+                    startBotServer();
                 } else {
-                    console.log(chalk.red.bold('[!] Session Logged Out.'));
+                    console.log(chalk.red.bold('[!] Logged Out. Clearing Session...'));
                     try {
                         await mongoose.connection.collection('sessions').deleteMany({});
                     } catch {}
@@ -159,7 +195,7 @@ async function startMainBot() {
             } else if (connection === 'open') {
                 console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS RUNNING AT 100% MAXIMUM SPEED! ⚡\n'));
                 const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
-                await sock.sendMessage(ownerJid, { text: '⚡ *DARK DINU V1 IS ONLINE & CONNECTED* ⚡' }).catch(() => {});
+                await sock.sendMessage(ownerJid, { text: '⚡ *DARK DINU V1 CONNECTED SUCCESSFULLY* ⚡' }).catch(() => {});
             }
         });
 
@@ -170,9 +206,10 @@ async function startMainBot() {
             await dispatchCommand(sock, m, config, settings);
         });
 
-    } catch (err) {
-        console.error(chalk.red('[MAIN BOT ERROR]:'), err.message);
+    } catch (e) {
+        console.error(chalk.red('[MAIN BOT ERROR]:'), e.message);
     }
 }
 
-startMainBot();
+// Check on boot
+startBotServer();
