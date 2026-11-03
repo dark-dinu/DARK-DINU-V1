@@ -1,5 +1,11 @@
 const { cmd } = require('../lib/handler');
-const { performance } = require('perf_hooks');
+
+// WhatsApp message timestamp (Long | number, seconds) -> ms
+function tsToMs(ts) {
+    if (!ts) return Date.now();
+    const sec = typeof ts === 'object' ? (ts.toNumber ? ts.toNumber() : ts.low) : Number(ts);
+    return sec * 1000;
+}
 
 cmd({
     pattern: 'ping',
@@ -8,15 +14,8 @@ cmd({
     category: 'general',
     react: '⚡'
 }, async (sock, m) => {
-    const start = performance.now();
-
-    // Instant Execution Speed
-    const end = performance.now();
-    let speed = Math.round(end - start);
-
-    if (speed < 5) {
-        speed = Math.floor(Math.random() * 25) + 38; // 38ms - 63ms real ultra response
-    }
+    // Real latency: time between the message being sent and the bot handling it
+    const speed = Math.max(0, Date.now() - tsToMs(m.messageTimestamp));
 
     const pingText = `*❬❬ DARK DINU SPEED🔥 ❭❭*\n\n` +
                      `▸ *Response:* \`${speed}ms\` ✔️\n` +
