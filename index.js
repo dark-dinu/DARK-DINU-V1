@@ -163,6 +163,9 @@ app.get('/pair', async (req, res) => {
     if (phone.length < 8 || phone.length > 15) {
         return res.status(400).json({ error: 'Please enter a valid number with country code.' });
     }
+    if (mongoose.connection.readyState !== 1) {
+        return res.status(503).json({ error: 'Database is not connected. Check MONGODB_URI in your Render environment.' });
+    }
     if (connected) {
         return res.status(409).json({ error: 'This bot is already linked and online.' });
     }
