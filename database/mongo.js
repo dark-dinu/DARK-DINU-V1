@@ -8,38 +8,90 @@ const AuthSchema = new mongoose.Schema({
 
 const Session = mongoose.models.Session || mongoose.model('Session', AuthSchema);
 
-const useMongoDBAuthState = async () => {
-    // ⚡ Ultra-fast RAM Memory Cache
-    const memory = new Map();
+// ───────────── Batched background writer ─────────────
+// Every Baileys key update used to fire its own Mongo query (hundreds when a
+// group message is sent). Now they are queued and written in ONE bulkWrite.
+const pending = new Map(); // id -> string (value) | null (delete)
+let flushTimer = null;
+let flushing = null;
 
-    // 1. Warm-up Phase: Start වෙද්දීම Session keys සියල්ල RAM එකට load කර ගැනීම
+function scheduleFlush() {
+    if (pending.size >= 300) return void flushNow();
+    if (flushTimer) return;
+    flushTimer = setTimeout(() => {
+        flushTimer = null;
+        flushNow();
+    }, 1000);
+}
+
+async function flushNow() {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    if (flushing) await flushing;
+    if (!pending.size) return;
+
+    const batch = Array.from(pending.entries());
+    pending.clear();
+
+    const ops = batch.map(([id, val]) =>
+        val === null
+            ? { deleteOne: { filter: { _id: id } } }
+            : { updateOne: { filter: { _id: id }, update: { $set: { data: val } }, upsert: true } }
+    );
+
+    flushing = Session.bulkWrite(ops, { ordered: false })
+        .catch((err) => {
+            console.error('[AUTH FLUSH ERROR]:', err.message);
+            // put back anything that has not been overwritten meanwhile, retry later
+            for (const [id, val] of batch) if (!pending.has(id)) pending.set(id, val);
+            scheduleFlush();
+        })
+        .finally(() => { flushing = null; });
+
+    await flushing;
+}
+
+// Make sure nothing is lost when the host stops / restarts the process
+for (const sig of ['SIGTERM', 'SIGINT']) {
+    process.once(sig, async () => {
+        try { await flushNow(); } catch (e) {}
+        process.exit(0);
+    });
+}
+
+const useMongoDBAuthState = async () => {
+    // Make sure the previous socket's writes are in Mongo before we reload
+    await flushNow().catch(() => {});
+
+    // ⚡ RAM cache - the single source of truth while the bot runs
+    const memory = new Map();
+    let warmed = false;
+
     try {
         const existingDocs = await Session.find({}).lean();
-        for (const doc of existingDocs) {
-            memory.set(doc._id, doc.data);
-        }
+        for (const doc of existingDocs) memory.set(doc._id, doc.data);
+        warmed = true;
     } catch (err) {
         console.error('[AUTH WARMUP ERROR]:', err.message);
     }
 
-    // 2. Non-blocking Async Database Writer
-    const writeData = async (data, id) => {
+    const writeData = (data, id) => {
         try {
             const val = JSON.stringify(data, BufferJSON.replacer);
-            // පළමුව ක්ෂණිකව Memory එක update කරයි (Instant Response)
-            memory.set(id, val);
-
-            // Database එකට background එකෙන් asynchronous update වේ
-            Session.findByIdAndUpdate(id, { data: val }, { upsert: true }).catch(() => {});
+            memory.set(id, val);       // instant
+            pending.set(id, val);      // background batch
+            scheduleFlush();
         } catch (e) {}
     };
 
-    // 3. 100% In-Memory Direct Reader (Mongo queries නැත)
     const readData = async (id) => {
         try {
-            if (memory.has(id)) {
-                return JSON.parse(memory.get(id), BufferJSON.reviver);
-            }
+            if (memory.has(id)) return JSON.parse(memory.get(id), BufferJSON.reviver);
+
+            // IMPORTANT: once RAM is warmed, a missing key really doesn't exist.
+            // The old code asked Atlas for every missing key (seconds of delay per
+            // first message / new group member). Now it returns instantly.
+            if (warmed) return null;
+
             const doc = await Session.findById(id).lean();
             if (!doc) return null;
             memory.set(id, doc.data);
@@ -49,11 +101,10 @@ const useMongoDBAuthState = async () => {
         }
     };
 
-    const removeData = async (id) => {
-        try {
-            memory.delete(id);
-            Session.findByIdAndDelete(id).catch(() => {});
-        } catch {}
+    const removeData = (id) => {
+        memory.delete(id);
+        pending.set(id, null);
+        scheduleFlush();
     };
 
     const creds = (await readData('creds')) || initAuthCreds();
@@ -76,20 +127,19 @@ const useMongoDBAuthState = async () => {
                     return data;
                 },
                 set: async (data) => {
-                    const tasks = [];
                     for (const category in data) {
                         for (const id in data[category]) {
                             const val = data[category][id];
                             const name = `${category}-${id}`;
-                            tasks.push(val ? writeData(val, name) : removeData(name));
+                            if (val) writeData(val, name);
+                            else removeData(name);
                         }
                     }
-                    await Promise.all(tasks);
                 }
             }
         },
-        saveCreds: () => writeData(creds, 'creds')
+        saveCreds: async () => writeData(creds, 'creds')
     };
 };
 
-module.exports = { useMongoDBAuthState };
+module.exports = { useMongoDBAuthState, flushNow };
