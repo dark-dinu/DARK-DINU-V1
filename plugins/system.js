@@ -3,6 +3,27 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 
+// ⚡ Startup එකේදීම Image එක RAM එකට Load කර තබා ගැනීම (Zero Disk I/O Delay)
+let cachedLogo = null;
+const possiblePaths = [
+    path.join(__dirname, '../Logo.png'),
+    path.join(__dirname, '../logo.png'),
+    path.join(__dirname, '../assets/Logo.png'),
+    path.join(__dirname, '../assets/logo.png'),
+    path.join(__dirname, '../Logo.jpg'),
+    path.join(__dirname, '../logo.jpg')
+];
+
+for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+        try {
+            cachedLogo = fs.readFileSync(p);
+            console.log(`[SYSTEM CMD] Logo loaded into memory from: ${path.basename(p)}`);
+            break;
+        } catch (e) {}
+    }
+}
+
 // Uptime calculation helper
 function formatUptime(seconds) {
     seconds = Number(seconds);
@@ -16,10 +37,10 @@ function formatUptime(seconds) {
 cmd({
     pattern: 'system',
     alias: ['status', 'botinfo', 'info'],
-    desc: 'Check server and bot system specifications with image',
+    desc: 'Check server and bot system specifications',
     category: 'general',
     react: '📟'
-}, async (sock, m, params, config) => {
+}, async (sock, m) => {
     // RAM Metrics
     const totalMem = (os.totalmem() / 1024 / 1024).toFixed(0);
     const freeMem = (os.freemem() / 1024 / 1024).toFixed(0);
@@ -52,21 +73,13 @@ cmd({
 
 > *◉ ᴅᴇᴠ ʜᴇꜱʜᴀɴ ᴏꜰᴄ ◉*`;
 
-    // Logo.png පරීක්ෂා කර බැලීම (Root හෝ Assets ෆෝල්ඩරයේ)
-    let logoPath = path.join(__dirname, '../Logo.png');
-    if (!fs.existsSync(logoPath)) {
-        logoPath = path.join(__dirname, '../assets/Logo.png');
-    }
-
-    if (fs.existsSync(logoPath)) {
-        // Image එක Buffer එකක් ලෙස ගෙන Caption සමඟ යැවීම
-        const imageBuffer = fs.readFileSync(logoPath);
+    // RAM එකේ ඇති Image Buffer එකෙන් ක්ෂණිකව යැවීම
+    if (cachedLogo) {
         await sock.sendMessage(m.jid, {
-            image: imageBuffer,
+            image: cachedLogo,
             caption: systemText
         }, { quoted: m });
     } else {
-        // Logo.png හමු නොවූයේ නම් සාමාන්‍ය Text එකක් ලෙස යැවීම
         await sock.sendMessage(m.jid, { text: systemText }, { quoted: m });
     }
 });
