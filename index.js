@@ -1,6 +1,8 @@
 const dns = require('dns');
-dns.setDefaultResultOrder('ipv4first');
-dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']);
+try {
+    dns.setDefaultResultOrder('ipv4first');
+    dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']);
+} catch (e) {}
 
 const express = require('express');
 const path = require('path');
@@ -24,7 +26,10 @@ const { loadPlugins, dispatchCommand } = require('./lib/handler');
 
 const app = express();
 const port = process.env.PORT || 8000;
+
+// High-speed Baileys internal caches
 const msgRetryCounterCache = new NodeCache();
+const userDevicesCache = new NodeCache({ stdTTL: 300 });
 const logger = pino({ level: 'silent' });
 
 app.use(express.json());
@@ -32,6 +37,11 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Self-ping endpoint for 24/7 uptime monitoring
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'active', connected });
 });
 
 // ───────────── State ─────────────
@@ -42,7 +52,10 @@ let pairBusy = false;
 
 async function connectDB() {
     if (mongoose.connection.readyState !== 1) {
-        await mongoose.connect(config.MONGODB_URI);
+        await mongoose.connect(config.MONGODB_URI, {
+            serverSelectionTimeoutMS: 15000,
+            family: 4
+        });
     }
 }
 
@@ -58,18 +71,17 @@ function stopSock() {
 async function wipeSession() {
     await connectDB();
     await mongoose.connection.collection('sessions').deleteMany({});
-    // Reset welcome alert flag on session wipe
     await settings.set('initialConnectSent', false);
 }
 
-// ───────────── Core connection ─────────────
+// ───────────── Core Connection Engine ─────────────
 async function startSock({ allowUnregistered = false } = {}) {
     await connectDB();
 
     const { state, saveCreds } = await useMongoDBAuthState();
 
     if (!state.creds.registered && !allowUnregistered) {
-        console.log(chalk.yellow('[INFO] No linked session. Waiting for pairing from the web page...'));
+        console.log(chalk.yellow('[INFO] No linked session. Waiting for pairing from web UI...'));
         return null;
     }
 
@@ -78,6 +90,7 @@ async function startSock({ allowUnregistered = false } = {}) {
 
     const { version } = await fetchLatestBaileysVersion();
 
+    // World-class production socket configuration
     const s = makeWASocket({
         version,
         logger,
@@ -87,11 +100,18 @@ async function startSock({ allowUnregistered = false } = {}) {
         },
         printQRInTerminal: false,
         browser: Browsers.ubuntu('Chrome'),
+        // Performance optimizations
         syncFullHistory: false,
-        markOnlineOnConnect: true,
+        markOnlineOnConnect: false,
+        generateHighQualityLinkPreview: false,
         msgRetryCounterCache,
+        userDevicesCache,
+        emitOwnEvents: false,
+        fireInitQueries: false,
         connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 25000
+        defaultQueryTimeoutMs: 0,
+        keepAliveIntervalMs: 15000,
+        retryRequestDelayMs: 250
     });
     sock = s;
 
@@ -106,7 +126,7 @@ async function startSock({ allowUnregistered = false } = {}) {
             connected = true;
             console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS ONLINE ⚡\n'));
 
-            // පළමු වතාවට Link වූ විට පමණක් Message එක යැවීම
+            // Initial link confirmation message (Sent strictly once)
             const alreadySent = settings.get('initialConnectSent');
             if (!alreadySent) {
                 const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
@@ -114,10 +134,10 @@ async function startSock({ allowUnregistered = false } = {}) {
                     text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
                           `🛡️ *Status:* Connected Successfully\n` +
                           `🛢️ *Database:* MongoDB Atlas\n` +
+                          `🚀 *Engine:* 2026 Production Turbo\n` +
                           `👑 *Developer:* 94719845166`
                 }).catch(() => {});
 
-                // Flag එක Database එකේ true කිරීම (නැවත reconnect වලදී මැසේජ් නොඑයි)
                 await settings.set('initialConnectSent', true);
             }
         }
@@ -136,7 +156,9 @@ async function startSock({ allowUnregistered = false } = {}) {
 
             if (!state.creds.registered) return;
 
-            await delay(code === DisconnectReason.restartRequired ? 500 : 3000);
+            // Fast reconnect for 515 restartRequired
+            const reconnectDelay = code === DisconnectReason.restartRequired ? 500 : 3000;
+            await delay(reconnectDelay);
             if (id !== sockId) return;
             startSock().catch((e) => console.error('[RECONNECT ERROR]:', e.message));
         }
@@ -169,7 +191,7 @@ app.get('/pair', async (req, res) => {
         return res.status(400).json({ error: 'Please enter a valid number with country code.' });
     }
     if (mongoose.connection.readyState !== 1) {
-        return res.status(503).json({ error: 'Database is not connected. Check MONGODB_URI in your Render environment.' });
+        return res.status(503).json({ error: 'Database is not connected. Check MONGODB_URI in your environment.' });
     }
     if (connected) {
         return res.status(409).json({ error: 'This bot is already linked and online.' });
@@ -202,19 +224,23 @@ app.get('/pair', async (req, res) => {
     }
 });
 
-// ───────────── Boot ─────────────
+// ───────────── Boot Sequence ─────────────
 (async () => {
     app.listen(port, () => console.log(chalk.green(`[SERVER] Live on port ${port}`)));
 
+    // Continuous DB connection handler
     while (true) {
         try {
-            await mongoose.connect(config.MONGODB_URI, { serverSelectionTimeoutMS: 15000 });
-            console.log(chalk.green('[DB] MongoDB connected'));
+            await mongoose.connect(config.MONGODB_URI, {
+                serverSelectionTimeoutMS: 15000,
+                family: 4
+            });
+            console.log(chalk.green('[DB] MongoDB connected successfully'));
             break;
         } catch (err) {
             console.error(chalk.red('[DB ERROR]:'), err.message, '- retrying in 8s');
             if (/ENOTFOUND|querySrv/i.test(err.message)) {
-                console.error(chalk.yellow('[HINT] Check MONGODB_URI (cluster hostname) and Atlas Network Access = 0.0.0.0/0'));
+                console.error(chalk.yellow('[HINT] Check MONGODB_URI and verify Atlas Network Access is set to 0.0.0.0/0'));
             }
             await delay(8000);
         }
