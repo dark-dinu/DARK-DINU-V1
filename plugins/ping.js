@@ -5,7 +5,7 @@ cmd({
     alias: ['speed', 'p'],
     desc: 'Check real-time bot speed',
     category: 'general',
-    react: '⚡'
+    react: '🚀'
 }, async (sock, m) => {
     // WhatsApp message timestamp එක සහ වත්මන් වේලාව අතර සැබෑ Latency එක
     const msgTimestamp = m.messageTimestamp ? Number(m.messageTimestamp) * 1000 : Date.now();
