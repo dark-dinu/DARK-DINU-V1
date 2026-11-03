@@ -36,7 +36,7 @@ app.get('/', (req, res) => {
 
 // ───────────── State ─────────────
 let sock = null;
-let sockId = 0;        // used to ignore events from old sockets
+let sockId = 0;
 let connected = false;
 let pairBusy = false;
 
@@ -58,12 +58,11 @@ function stopSock() {
 async function wipeSession() {
     await connectDB();
     await mongoose.connection.collection('sessions').deleteMany({});
+    // Reset welcome alert flag on session wipe
+    await settings.set('initialConnectSent', false);
 }
 
 // ───────────── Core connection ─────────────
-// Single function used for BOTH pairing and normal running.
-// After pairing WhatsApp forces a disconnect (code 515 "restartRequired").
-// We must reconnect with the same auth state - the old code never did this.
 async function startSock({ allowUnregistered = false } = {}) {
     await connectDB();
 
@@ -99,20 +98,28 @@ async function startSock({ allowUnregistered = false } = {}) {
     s.ev.on('creds.update', saveCreds);
 
     s.ev.on('connection.update', async (update) => {
-        if (id !== sockId) return; // stale socket
+        if (id !== sockId) return;
 
         const { connection, lastDisconnect } = update;
 
         if (connection === 'open') {
             connected = true;
             console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS ONLINE ⚡\n'));
-            const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
-            await s.sendMessage(ownerJid, {
-                text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
-                      `🛡️ *Status:* Connected Successfully\n` +
-                      `🛢️ *Database:* MongoDB Atlas\n` +
-                      `👑 *Developer:* 94719845166`
-            }).catch(() => {});
+
+            // පළමු වතාවට Link වූ විට පමණක් Message එක යැවීම
+            const alreadySent = settings.get('initialConnectSent');
+            if (!alreadySent) {
+                const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
+                await s.sendMessage(ownerJid, {
+                    text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
+                          `🛡️ *Status:* Connected Successfully\n` +
+                          `🛢️ *Database:* MongoDB Atlas\n` +
+                          `👑 *Developer:* 94719845166`
+                }).catch(() => {});
+
+                // Flag එක Database එකේ true කිරීම (නැවත reconnect වලදී මැසේජ් නොඑයි)
+                await settings.set('initialConnectSent', true);
+            }
         }
 
         if (connection === 'close') {
@@ -127,10 +134,8 @@ async function startSock({ allowUnregistered = false } = {}) {
                 return;
             }
 
-            // Not linked yet (user never entered the code) -> don't loop
             if (!state.creds.registered) return;
 
-            // 515 = restart required right after pairing -> reconnect fast
             await delay(code === DisconnectReason.restartRequired ? 500 : 3000);
             if (id !== sockId) return;
             startSock().catch((e) => console.error('[RECONNECT ERROR]:', e.message));
@@ -181,7 +186,6 @@ app.get('/pair', async (req, res) => {
         const result = await startSock({ allowUnregistered: true });
         if (!result) throw new Error('Could not start connection.');
 
-        // give the socket time to open its websocket
         await delay(3000);
 
         const raw = await result.sock.requestPairingCode(phone);
@@ -200,10 +204,8 @@ app.get('/pair', async (req, res) => {
 
 // ───────────── Boot ─────────────
 (async () => {
-    // Web server first so Render never kills the app
     app.listen(port, () => console.log(chalk.green(`[SERVER] Live on port ${port}`)));
 
-    // Keep retrying until MongoDB connects
     while (true) {
         try {
             await mongoose.connect(config.MONGODB_URI, { serverSelectionTimeoutMS: 15000 });
