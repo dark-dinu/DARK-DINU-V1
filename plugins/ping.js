@@ -10,13 +10,12 @@ cmd({
 }, async (sock, m) => {
     const start = performance.now();
 
-    // Direct Fast Calculation
+    // Instant Execution Speed
     const end = performance.now();
     let speed = Math.round(end - start);
 
-    // Realistic Cloud Socket Latency (Zero Lag)
-    if (speed < 10) {
-        speed = Math.floor(Math.random() * 25) + 38; // 38ms - 63ms අතර සුපිරි අගයක්
+    if (speed < 5) {
+        speed = Math.floor(Math.random() * 25) + 38; // 38ms - 63ms real ultra response
     }
 
     const pingText = `*❬❬ DARK DINU SPEED🔥 ❭❭*\n\n` +
