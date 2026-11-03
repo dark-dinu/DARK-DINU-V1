@@ -38,6 +38,10 @@ const userDevicesCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 const groupCache = new NodeCache({ stdTTL: 600, checkperiod: 120, useClones: false });
 const logger = pino({ level: 'silent' });
 
+// Crash වීම වළක්වන්න
+process.on('unhandledRejection', (e) => console.error('[UNHANDLED REJECTION]:', e?.message || e));
+process.on('uncaughtException', (e) => console.error('[UNCAUGHT EXCEPTION]:', e?.message || e));
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -48,6 +52,9 @@ app.get('/', (req, res) => {
 // ───────────── Multi-Session Registry ─────────────
 const sessions = new Map();
 const pairingInProgress = new Set();
+
+// FIX: pairing එකෙන් පස්සේ creds.registered true නොවෙන්න පුළුවන්, creds.me තියෙනවා නම් link වෙලා
+const isRegistered = (creds) => !!(creds && (creds.registered || creds.me));
 
 async function connectDB() {
     if (mongoose.connection.readyState !== 1) {
@@ -75,7 +82,7 @@ async function startSession(sessionId, { allowUnregistered = false } = {}) {
 
     const { state, saveCreds } = await useMongoDBAuthState(sessionId);
 
-    if (!state.creds.registered && !allowUnregistered) {
+    if (!isRegistered(state.creds) && !allowUnregistered) {
         return null;
     }
 
@@ -99,15 +106,15 @@ async function startSession(sessionId, { allowUnregistered = false } = {}) {
         version = latest.version;
     } catch (e) {}
 
-    const s = makeWASocket({
-        version,
+    const socketConfig = {
         logger,
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger)
         },
         printQRInTerminal: false,
-        browser: Browsers.macOS('Desktop'),
+        // FIX: pairing code සඳහා Chrome browser signature අවශ්‍යයි
+        browser: Browsers.ubuntu('Chrome'),
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,
         shouldIgnoreJid: (jid) => !!jid && (jid.endsWith('@broadcast') || jid.endsWith('@newsletter')),
@@ -117,11 +124,14 @@ async function startSession(sessionId, { allowUnregistered = false } = {}) {
         msgRetryCounterCache,
         userDevicesCache,
         emitOwnEvents: false,
-        fireInitQueries: false,
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 15000,
         defaultQueryTimeoutMs: 60000
-    });
+    };
+    // FIX: version undefined නම් default version overwrite වෙනවා -> connect වෙන්නේ නෑ
+    if (version) socketConfig.version = version;
+
+    const s = makeWASocket(socketConfig);
 
     sessionObj.sock = s;
 
@@ -182,12 +192,14 @@ async function startSession(sessionId, { allowUnregistered = false } = {}) {
 
             if (code === DisconnectReason.loggedOut) {
                 console.log(chalk.red(`[!] Session ${sessionId} logged out. Cleaning data.`));
-                await deleteSession(sessionId).catch(() => {});
                 stopSession(sessionId);
+                await deleteSession(sessionId).catch(() => {});
                 return;
             }
 
-            if (!state.creds.registered) return;
+            // FIX: pairing සාර්ථක වුණාම WhatsApp 515 (restartRequired) දෙනවා.
+            // creds.me තියෙනවා නම් reconnect කරන්න ඕන.
+            if (!isRegistered(state.creds)) return;
 
             const reconnectDelay = code === DisconnectReason.restartRequired ? 1000 : 3500;
             await delay(reconnectDelay);
@@ -232,7 +244,7 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Fixed Pairing Code Route with Handshake Stabilizer
+// Pairing Code Route (retry සමඟ)
 app.get('/pair', async (req, res) => {
     const phone = String(req.query.phone || '').replace(/[^0-9]/g, '');
 
@@ -252,18 +264,33 @@ app.get('/pair', async (req, res) => {
         stopSession(phone);
         await deleteSession(phone).catch(() => {});
 
-        const result = await startSession(phone, { allowUnregistered: true });
-        if (!result || !result.sock) throw new Error('Could not initiate connection.');
+        let code = null;
+        let lastErr = null;
 
-        // WhatsApp WebSocket handshake එක සූදානම් වීමට තත්පර 6ක් රැඳී සිටීම
-        await delay(6000);
+        for (let attempt = 1; attempt <= 3 && !code; attempt++) {
+            try {
+                const result = await startSession(phone, { allowUnregistered: true });
+                if (!result || !result.sock) throw new Error('Could not initiate connection.');
 
-        if (result.sock.authState.creds.registered) {
-            return res.status(409).json({ error: 'This phone number is already registered.' });
+                // WebSocket handshake සූදානම් වීමට රැඳී සිටීම
+                await delay(4000);
+
+                if (isRegistered(result.sock.authState.creds)) {
+                    return res.status(409).json({ error: 'This phone number is already registered.' });
+                }
+
+                code = await result.sock.requestPairingCode(phone);
+            } catch (e) {
+                lastErr = e;
+                console.error(chalk.yellow(`[PAIR RETRY ${phone}] attempt ${attempt}: ${e.message}`));
+                stopSession(phone);
+                await delay(2000);
+            }
         }
 
-        const raw = await result.sock.requestPairingCode(phone);
-        const formatted = raw?.match(/.{1,4}/g)?.join('-') || raw;
+        if (!code) throw lastErr || new Error('Pairing failed.');
+
+        const formatted = code.match(/.{1,4}/g)?.join('-') || code;
         console.log(chalk.cyan(`[PAIRING] New session code for ${phone}: ${formatted}`));
 
         return res.json({ code: formatted, phone });
