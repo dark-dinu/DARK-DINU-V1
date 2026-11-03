@@ -3,13 +3,13 @@ const { proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 
 const AuthSchema = new mongoose.Schema({
     _id: { type: String, required: true },
-    sessionId: { type: String, required: true, index: true },
+    sessionId: { type: String, index: true },
     data: { type: String, required: true }
 }, { versionKey: false });
 
 const Session = mongoose.models.Session || mongoose.model('Session', AuthSchema);
 
-// ───────────── Batched Background Writer (Per-Session Safe) ─────────────
+// ───────────── Batched Background Writer ─────────────
 const pending = new Map(); // id -> { sessionId, val }
 let flushTimer = null;
 let flushing = null;
@@ -37,7 +37,12 @@ async function flushNow() {
             : {
                   updateOne: {
                       filter: { _id: id },
-                      update: { $set: { data: item.val, sessionId: item.sessionId } },
+                      update: { 
+                          $set: { 
+                              data: item.val, 
+                              ...(item.sessionId ? { sessionId: item.sessionId } : {}) 
+                          } 
+                      },
                       upsert: true
                   }
               }
@@ -56,7 +61,6 @@ async function flushNow() {
     await flushing;
 }
 
-// Graceful host shutdown
 for (const sig of ['SIGTERM', 'SIGINT']) {
     process.once(sig, async () => {
         try { await flushNow(); } catch (e) {}
@@ -65,21 +69,24 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 }
 
 /**
- * Multi-Session Isolated Auth State
- * @param {string} sessionId - Phone number or unique session key
+ * Universal Multi-Session + Legacy Auth State Engine
  */
 const useMongoDBAuthState = async (sessionId = 'default') => {
     await flushNow().catch(() => {});
 
-    // In-memory RAM cache for this specific session
     const memory = new Map();
     let warmed = false;
+    const isLegacy = (sessionId === 'legacy');
 
     try {
-        const existingDocs = await Session.find({ sessionId }).lean();
+        // පරණ database session එකක් නම් prefix නොමැතිව load කරගනී
+        const query = isLegacy 
+            ? { $or: [{ sessionId: 'legacy' }, { sessionId: { $exists: false } }] } 
+            : { sessionId };
+
+        const existingDocs = await Session.find(query).lean();
         for (const doc of existingDocs) {
-            // Strip session prefix for clean in-memory key access
-            const localId = doc._id.replace(`${sessionId}_`, '');
+            const localId = isLegacy ? doc._id : doc._id.replace(`${sessionId}_`, '');
             memory.set(localId, doc.data);
         }
         warmed = true;
@@ -91,8 +98,8 @@ const useMongoDBAuthState = async (sessionId = 'default') => {
         try {
             const val = JSON.stringify(data, BufferJSON.replacer);
             memory.set(id, val);
-            const globalId = `${sessionId}_${id}`;
-            pending.set(globalId, { sessionId, val });
+            const globalId = isLegacy ? id : `${sessionId}_${id}`;
+            pending.set(globalId, { sessionId: isLegacy ? 'legacy' : sessionId, val });
             scheduleFlush();
         } catch (e) {}
     };
@@ -102,7 +109,7 @@ const useMongoDBAuthState = async (sessionId = 'default') => {
             if (memory.has(id)) return JSON.parse(memory.get(id), BufferJSON.reviver);
             if (warmed) return null;
 
-            const globalId = `${sessionId}_${id}`;
+            const globalId = isLegacy ? id : `${sessionId}_${id}`;
             const doc = await Session.findById(globalId).lean();
             if (!doc) return null;
             memory.set(id, doc.data);
@@ -114,8 +121,8 @@ const useMongoDBAuthState = async (sessionId = 'default') => {
 
     const removeData = (id) => {
         memory.delete(id);
-        const globalId = `${sessionId}_${id}`;
-        pending.set(globalId, { sessionId, val: null });
+        const globalId = isLegacy ? id : `${sessionId}_${id}`;
+        pending.set(globalId, { sessionId: isLegacy ? 'legacy' : sessionId, val: null });
         scheduleFlush();
     };
 
@@ -155,20 +162,34 @@ const useMongoDBAuthState = async (sessionId = 'default') => {
 };
 
 /**
- * Get all active registered session IDs from MongoDB
+ * Scan All Active Registered Sessions (Legacy + Multi-Tenant)
  */
 async function getAllRegisteredSessions() {
     try {
-        const credDocs = await Session.find({ _id: { $regex: /_creds$/ } }).lean();
         const sessionIds = [];
-        for (const doc of credDocs) {
+
+        // 1. පරණ තනි Session එකක් තිබේදැයි බැලීම
+        const legacyCredDoc = await Session.findById('creds').lean();
+        if (legacyCredDoc) {
+            try {
+                const creds = JSON.parse(legacyCredDoc.data, BufferJSON.reviver);
+                if (creds && creds.registered) {
+                    sessionIds.push('legacy');
+                }
+            } catch (e) {}
+        }
+
+        // 2. Multi-device sessions හඳුනාගැනීම
+        const multiCredDocs = await Session.find({ _id: { $regex: /_creds$/ } }).lean();
+        for (const doc of multiCredDocs) {
             try {
                 const creds = JSON.parse(doc.data, BufferJSON.reviver);
-                if (creds && creds.registered) {
+                if (creds && creds.registered && doc.sessionId) {
                     sessionIds.push(doc.sessionId);
                 }
             } catch (e) {}
         }
+
         return [...new Set(sessionIds)];
     } catch (e) {
         return [];
@@ -180,7 +201,11 @@ async function getAllRegisteredSessions() {
  */
 async function deleteSession(sessionId) {
     await flushNow().catch(() => {});
-    await Session.deleteMany({ sessionId });
+    if (sessionId === 'legacy') {
+        await Session.deleteMany({ $or: [{ sessionId: 'legacy' }, { sessionId: { $exists: false } }] });
+    } else {
+        await Session.deleteMany({ sessionId });
+    }
 }
 
 module.exports = {
