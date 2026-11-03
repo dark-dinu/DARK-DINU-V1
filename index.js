@@ -33,7 +33,6 @@ const { loadPlugins, dispatchCommand } = require('./lib/handler');
 const app = express();
 const port = process.env.PORT || 8000;
 
-// High-speed Baileys internal caches
 const msgRetryCounterCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 const userDevicesCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 const groupCache = new NodeCache({ stdTTL: 600, checkperiod: 120, useClones: false });
@@ -47,7 +46,7 @@ app.get('/', (req, res) => {
 });
 
 // ───────────── Multi-Session Registry ─────────────
-const sessions = new Map(); // sessionId -> { sock, sockId, connected, activePulse }
+const sessions = new Map();
 const pairingInProgress = new Set();
 
 async function connectDB() {
@@ -157,13 +156,12 @@ async function startSession(sessionId, { allowUnregistered = false } = {}) {
                 }
             }, 25000);
 
-            // Welcome Notification (Per Session)
             const alertKey = `initialSent_${sessionId}`;
             const alreadySent = settings.get(alertKey);
             if (!alreadySent) {
                 const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
                 await s.sendMessage(ownerJid, {
-                    text: `⚡ *DARK DINU V1 LINKED* ⚡\n\n` +
+                    text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
                           `📱 *Account:* ${sessionId}\n` +
                           `🛡️ *Status:* Connected Successfully\n` +
                           `👑 *Developer:* 94719845166`
@@ -215,8 +213,6 @@ async function startSession(sessionId, { allowUnregistered = false } = {}) {
 }
 
 // ───────────── Web Multi-Device API ─────────────
-
-// Status of all active bots
 app.get('/status', (req, res) => {
     const list = [];
     for (const [id, s] of sessions.entries()) {
@@ -236,7 +232,7 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Multi-device pairing endpoint (Any number can pair independently)
+// Fixed Pairing Code Route with Handshake Stabilizer
 app.get('/pair', async (req, res) => {
     const phone = String(req.query.phone || '').replace(/[^0-9]/g, '');
 
@@ -247,23 +243,24 @@ app.get('/pair', async (req, res) => {
         return res.status(503).json({ error: 'Database is not connected.' });
     }
 
-    const existing = sessions.get(phone);
-    if (existing && existing.connected) {
-        return res.status(409).json({ error: 'This phone number is already linked and online.' });
-    }
     if (pairingInProgress.has(phone)) {
-        return res.status(429).json({ error: 'Pairing already in progress for this number. Please wait.' });
+        return res.status(429).json({ error: 'Pairing already in progress. Please wait 10 seconds.' });
     }
 
     pairingInProgress.add(phone);
     try {
         stopSession(phone);
-        await deleteSession(phone);
+        await deleteSession(phone).catch(() => {});
 
         const result = await startSession(phone, { allowUnregistered: true });
-        if (!result) throw new Error('Could not initiate connection.');
+        if (!result || !result.sock) throw new Error('Could not initiate connection.');
 
-        await delay(3000);
+        // WhatsApp WebSocket handshake එක සූදානම් වීමට තත්පර 6ක් රැඳී සිටීම
+        await delay(6000);
+
+        if (result.sock.authState.creds.registered) {
+            return res.status(409).json({ error: 'This phone number is already registered.' });
+        }
 
         const raw = await result.sock.requestPairingCode(phone);
         const formatted = raw?.match(/.{1,4}/g)?.join('-') || raw;
@@ -315,7 +312,6 @@ function startKeepAlive() {
         await settings.initSettings();
         loadPlugins();
 
-        // MongoDB එකේ සේව් වී ඇති සියලුම linked numbers එකවර ආරම්භ කිරීම
         const savedSessions = await getAllRegisteredSessions();
         console.log(chalk.cyan(`[BOOT] Found ${savedSessions.length} registered WhatsApp session(s). Starting...`));
 
@@ -323,7 +319,7 @@ function startKeepAlive() {
             startSession(sessionId).catch((err) => {
                 console.error(`[BOOT ERROR ${sessionId}]:`, err.message);
             });
-            await delay(1500); // Concurrency stagger
+            await delay(1500);
         }
     } catch (err) {
         console.error(chalk.red('[BOOT ERROR]:'), err.message);
