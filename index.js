@@ -6,6 +6,8 @@ try {
 
 const express = require('express');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 const {
     default: makeWASocket,
     DisconnectReason,
@@ -27,9 +29,7 @@ const { loadPlugins, dispatchCommand } = require('./lib/handler');
 const app = express();
 const port = process.env.PORT || 8000;
 
-// High-speed Baileys internal caches
 const msgRetryCounterCache = new NodeCache();
-const userDevicesCache = new NodeCache({ stdTTL: 300 });
 const logger = pino({ level: 'silent' });
 
 app.use(express.json());
@@ -39,7 +39,7 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Self-ping endpoint for 24/7 uptime monitoring
+// Self-ping & Uptime monitor route
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'active', connected });
 });
@@ -90,7 +90,7 @@ async function startSock({ allowUnregistered = false } = {}) {
 
     const { version } = await fetchLatestBaileysVersion();
 
-    // World-class production socket configuration
+    // 24/7 Stable Socket Configuration
     const s = makeWASocket({
         version,
         logger,
@@ -99,19 +99,14 @@ async function startSock({ allowUnregistered = false } = {}) {
             keys: makeCacheableSignalKeyStore(state.keys, logger)
         },
         printQRInTerminal: false,
-        browser: Browsers.ubuntu('Chrome'),
-        // Performance optimizations
+        browser: Browsers.macOS('Chrome'),
         syncFullHistory: false,
-        markOnlineOnConnect: false,
+        markOnlineOnConnect: true, // Online තබා ගැනීමෙන් WhatsApp සර්වර් drop වීම වළක්වයි
         generateHighQualityLinkPreview: false,
         msgRetryCounterCache,
-        userDevicesCache,
-        emitOwnEvents: false,
-        fireInitQueries: false,
         connectTimeoutMs: 60000,
-        defaultQueryTimeoutMs: 0,
-        keepAliveIntervalMs: 15000,
-        retryRequestDelayMs: 250
+        keepAliveIntervalMs: 30000, // නිවැරදි Ping Interval එක (WhatsApp Connection Drop නොවේ)
+        defaultQueryTimeoutMs: 60000 // Query Timeout එක 0 නොකර 60s තැබීම
     });
     sock = s;
 
@@ -124,17 +119,16 @@ async function startSock({ allowUnregistered = false } = {}) {
 
         if (connection === 'open') {
             connected = true;
-            console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS ONLINE ⚡\n'));
+            console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS ONLINE 24/7 ⚡\n'));
 
-            // Initial link confirmation message (Sent strictly once)
             const alreadySent = settings.get('initialConnectSent');
             if (!alreadySent) {
                 const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
                 await s.sendMessage(ownerJid, {
-                    text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
-                          `🛡️ *Status:* Connected Successfully\n` +
+                    text: `⚡ *DARK DINU V1 IS ONLINE 24/7* ⚡\n\n` +
+                          `🛡️ *Status:* Connected Permanently\n` +
                           `🛢️ *Database:* MongoDB Atlas\n` +
-                          `🚀 *Engine:* 2026 Production Turbo\n` +
+                          `🚀 *Engine:* High Speed Active\n` +
                           `👑 *Developer:* 94719845166`
                 }).catch(() => {});
 
@@ -156,8 +150,8 @@ async function startSock({ allowUnregistered = false } = {}) {
 
             if (!state.creds.registered) return;
 
-            // Fast reconnect for 515 restartRequired
-            const reconnectDelay = code === DisconnectReason.restartRequired ? 500 : 3000;
+            // Stable reconnect backoff (Loop එකට නොවැටී reconnect වේ)
+            const reconnectDelay = code === DisconnectReason.restartRequired ? 1500 : 4000;
             await delay(reconnectDelay);
             if (id !== sockId) return;
             startSock().catch((e) => console.error('[RECONNECT ERROR]:', e.message));
@@ -191,13 +185,13 @@ app.get('/pair', async (req, res) => {
         return res.status(400).json({ error: 'Please enter a valid number with country code.' });
     }
     if (mongoose.connection.readyState !== 1) {
-        return res.status(503).json({ error: 'Database is not connected. Check MONGODB_URI in your environment.' });
+        return res.status(503).json({ error: 'Database is not connected.' });
     }
     if (connected) {
         return res.status(409).json({ error: 'This bot is already linked and online.' });
     }
     if (pairBusy) {
-        return res.status(429).json({ error: 'A request is already in progress. Please wait.' });
+        return res.status(429).json({ error: 'Pairing in progress. Please wait.' });
     }
 
     pairBusy = true;
@@ -224,11 +218,27 @@ app.get('/pair', async (req, res) => {
     }
 });
 
+// ───────────── Render Auto Keep-Alive (24/7 Sleep Preventer) ─────────────
+function startKeepAlive() {
+    // මිනිත්තු 4කට වරක් සර්වර් එකටම ping ගසා Render එක Sleep වීම නවත්වයි
+    setInterval(() => {
+        const renderUrl = process.env.RENDER_EXTERNAL_URL;
+        if (renderUrl) {
+            const client = renderUrl.startsWith('https') ? https : http;
+            client.get(`${renderUrl}/health`, (res) => {
+                // Keep-alive ping success
+            }).on('error', () => {});
+        }
+    }, 4 * 60 * 1000);
+}
+
 // ───────────── Boot Sequence ─────────────
 (async () => {
-    app.listen(port, () => console.log(chalk.green(`[SERVER] Live on port ${port}`)));
+    app.listen(port, () => {
+        console.log(chalk.green(`[SERVER] Live on port ${port}`));
+        startKeepAlive();
+    });
 
-    // Continuous DB connection handler
     while (true) {
         try {
             await mongoose.connect(config.MONGODB_URI, {
@@ -239,9 +249,6 @@ app.get('/pair', async (req, res) => {
             break;
         } catch (err) {
             console.error(chalk.red('[DB ERROR]:'), err.message, '- retrying in 8s');
-            if (/ENOTFOUND|querySrv/i.test(err.message)) {
-                console.error(chalk.yellow('[HINT] Check MONGODB_URI and verify Atlas Network Access is set to 0.0.0.0/0'));
-            }
             await delay(8000);
         }
     }
