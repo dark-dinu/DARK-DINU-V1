@@ -32,6 +32,9 @@ const port = process.env.PORT || 8000;
 // High-speed Baileys internal caches
 const msgRetryCounterCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 const userDevicesCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+// Group metadata cache - without this Baileys asks WhatsApp for the member list
+// on EVERY message sent to a group (main reason groups were so slow)
+const groupCache = new NodeCache({ stdTTL: 600, checkperiod: 120, useClones: false });
 const logger = pino({ level: 'silent' });
 
 app.use(express.json());
@@ -95,7 +98,15 @@ async function startSock({ allowUnregistered = false } = {}) {
     stopSock();
     const id = sockId;
 
-    const { version } = await fetchLatestBaileysVersion();
+    // Never let a slow version lookup hold up (re)connecting
+    let version;
+    try {
+        const latest = await Promise.race([
+            fetchLatestBaileysVersion(),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))
+        ]);
+        version = latest.version;
+    } catch (e) {}
 
     // 24/7 Ultra Fast Stable Socket
     const s = makeWASocket({
@@ -108,6 +119,11 @@ async function startSock({ allowUnregistered = false } = {}) {
         printQRInTerminal: false,
         browser: Browsers.macOS('Desktop'),
         syncFullHistory: false,
+        shouldSyncHistoryMessage: () => false,
+        // Skip status updates / broadcast lists / channels: decrypting them
+        // all day long was eating CPU and delaying real commands
+        shouldIgnoreJid: (jid) => !!jid && (jid.endsWith('@broadcast') || jid.endsWith('@newsletter')),
+        cachedGroupMetadata: async (jid) => groupCache.get(jid),
         markOnlineOnConnect: true,
         generateHighQualityLinkPreview: false,
         msgRetryCounterCache,
@@ -120,7 +136,33 @@ async function startSock({ allowUnregistered = false } = {}) {
     });
     sock = s;
 
+    // Cached group metadata helper (used by handler.js too)
+    s.getGroupMeta = async (jid) => {
+        let meta = groupCache.get(jid);
+        if (!meta) {
+            meta = await s.groupMetadata(jid);
+            groupCache.set(jid, meta);
+        }
+        return meta;
+    };
+
     s.ev.on('creds.update', saveCreds);
+
+    s.ev.on('groups.upsert', (groups) => {
+        for (const g of groups) groupCache.set(g.id, g);
+    });
+    s.ev.on('groups.update', async (updates) => {
+        for (const u of updates) {
+            if (!u.id) continue;
+            const cached = groupCache.get(u.id);
+            if (cached) groupCache.set(u.id, { ...cached, ...u });
+        }
+    });
+    s.ev.on('group-participants.update', ({ id }) => {
+        // member list changed -> refresh on next use
+        groupCache.del(id);
+        s.getGroupMeta(id).catch(() => {});
+    });
 
     s.ev.on('connection.update', async (update) => {
         if (id !== sockId) return;
@@ -130,6 +172,11 @@ async function startSock({ allowUnregistered = false } = {}) {
         if (connection === 'open') {
             connected = true;
             console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS ONLINE 24/7 ⚡\n'));
+
+            // Fill the group cache once, in the background
+            s.groupFetchAllParticipating()
+                .then((all) => { for (const jid in all) groupCache.set(jid, all[jid]); })
+                .catch(() => {});
 
             // Anti-Idle Stream Pulse (විනාඩි ගණනක් මැසේජ් නොආවත් WebSocket connection එක dormant වීම වළක්වයි)
             if (activePulse) clearInterval(activePulse);
@@ -186,12 +233,16 @@ async function startSock({ allowUnregistered = false } = {}) {
     s.ev.on('messages.upsert', async ({ messages, type }) => {
         if (id !== sockId) return;
         if (type !== 'notify') return;
-        const m = messages[0];
-        if (!m || !m.message) return;
-        try {
-            await dispatchCommand(s, m, config, settings);
-        } catch (e) {
-            console.error('[CMD ERROR]:', e.message);
+
+        // Handle EVERY message in the batch, all at once.
+        // (old code only looked at messages[0] and awaited it, so one slow
+        //  command made every other command wait in line)
+        for (const m of messages) {
+            if (!m || !m.message) continue;
+            if (m.key?.remoteJid === 'status@broadcast') continue;
+            dispatchCommand(s, m, config, settings).catch((e) =>
+                console.error('[CMD ERROR]:', e.message)
+            );
         }
     });
 
