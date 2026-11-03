@@ -10,7 +10,7 @@ const AuthSchema = new mongoose.Schema({
 const Session = mongoose.models.Session || mongoose.model('Session', AuthSchema);
 
 // ───────────── Batched Background Writer ─────────────
-const pending = new Map(); // id -> { sessionId, val }
+const pending = new Map();
 let flushTimer = null;
 let flushing = null;
 
@@ -79,7 +79,6 @@ const useMongoDBAuthState = async (sessionId = 'default') => {
     const isLegacy = (sessionId === 'legacy');
 
     try {
-        // පරණ database session එකක් නම් prefix නොමැතිව load කරගනී
         const query = isLegacy 
             ? { $or: [{ sessionId: 'legacy' }, { sessionId: { $exists: false } }] } 
             : { sessionId };
@@ -162,13 +161,13 @@ const useMongoDBAuthState = async (sessionId = 'default') => {
 };
 
 /**
- * Scan All Active Registered Sessions (Legacy + Multi-Tenant)
+ * Scan All Active Registered Sessions
  */
 async function getAllRegisteredSessions() {
     try {
         const sessionIds = [];
 
-        // 1. පරණ තනි Session එකක් තිබේදැයි බැලීම
+        // Check for legacy single-session
         const legacyCredDoc = await Session.findById('creds').lean();
         if (legacyCredDoc) {
             try {
@@ -179,7 +178,7 @@ async function getAllRegisteredSessions() {
             } catch (e) {}
         }
 
-        // 2. Multi-device sessions හඳුනාගැනීම
+        // Check for multi-tenant sessions
         const multiCredDocs = await Session.find({ _id: { $regex: /_creds$/ } }).lean();
         for (const doc of multiCredDocs) {
             try {
@@ -197,7 +196,7 @@ async function getAllRegisteredSessions() {
 }
 
 /**
- * Delete a specific session
+ * Delete session cleanly
  */
 async function deleteSession(sessionId) {
     await flushNow().catch(() => {});
