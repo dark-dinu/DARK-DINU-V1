@@ -3,15 +3,14 @@ const { proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 
 const AuthSchema = new mongoose.Schema({
     _id: { type: String, required: true },
+    sessionId: { type: String, required: true, index: true },
     data: { type: String, required: true }
 }, { versionKey: false });
 
 const Session = mongoose.models.Session || mongoose.model('Session', AuthSchema);
 
-// ───────────── Batched background writer ─────────────
-// Every Baileys key update used to fire its own Mongo query (hundreds when a
-// group message is sent). Now they are queued and written in ONE bulkWrite.
-const pending = new Map(); // id -> string (value) | null (delete)
+// ───────────── Batched Background Writer (Per-Session Safe) ─────────────
+const pending = new Map(); // id -> { sessionId, val }
 let flushTimer = null;
 let flushing = null;
 
@@ -32,17 +31,24 @@ async function flushNow() {
     const batch = Array.from(pending.entries());
     pending.clear();
 
-    const ops = batch.map(([id, val]) =>
-        val === null
+    const ops = batch.map(([id, item]) =>
+        item.val === null
             ? { deleteOne: { filter: { _id: id } } }
-            : { updateOne: { filter: { _id: id }, update: { $set: { data: val } }, upsert: true } }
+            : {
+                  updateOne: {
+                      filter: { _id: id },
+                      update: { $set: { data: item.val, sessionId: item.sessionId } },
+                      upsert: true
+                  }
+              }
     );
 
     flushing = Session.bulkWrite(ops, { ordered: false })
         .catch((err) => {
             console.error('[AUTH FLUSH ERROR]:', err.message);
-            // put back anything that has not been overwritten meanwhile, retry later
-            for (const [id, val] of batch) if (!pending.has(id)) pending.set(id, val);
+            for (const [id, item] of batch) {
+                if (!pending.has(id)) pending.set(id, item);
+            }
             scheduleFlush();
         })
         .finally(() => { flushing = null; });
@@ -50,7 +56,7 @@ async function flushNow() {
     await flushing;
 }
 
-// Make sure nothing is lost when the host stops / restarts the process
+// Graceful host shutdown
 for (const sig of ['SIGTERM', 'SIGINT']) {
     process.once(sig, async () => {
         try { await flushNow(); } catch (e) {}
@@ -58,27 +64,35 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     });
 }
 
-const useMongoDBAuthState = async () => {
-    // Make sure the previous socket's writes are in Mongo before we reload
+/**
+ * Multi-Session Isolated Auth State
+ * @param {string} sessionId - Phone number or unique session key
+ */
+const useMongoDBAuthState = async (sessionId = 'default') => {
     await flushNow().catch(() => {});
 
-    // ⚡ RAM cache - the single source of truth while the bot runs
+    // In-memory RAM cache for this specific session
     const memory = new Map();
     let warmed = false;
 
     try {
-        const existingDocs = await Session.find({}).lean();
-        for (const doc of existingDocs) memory.set(doc._id, doc.data);
+        const existingDocs = await Session.find({ sessionId }).lean();
+        for (const doc of existingDocs) {
+            // Strip session prefix for clean in-memory key access
+            const localId = doc._id.replace(`${sessionId}_`, '');
+            memory.set(localId, doc.data);
+        }
         warmed = true;
     } catch (err) {
-        console.error('[AUTH WARMUP ERROR]:', err.message);
+        console.error(`[AUTH WARMUP ERROR - ${sessionId}]:`, err.message);
     }
 
     const writeData = (data, id) => {
         try {
             const val = JSON.stringify(data, BufferJSON.replacer);
-            memory.set(id, val);       // instant
-            pending.set(id, val);      // background batch
+            memory.set(id, val);
+            const globalId = `${sessionId}_${id}`;
+            pending.set(globalId, { sessionId, val });
             scheduleFlush();
         } catch (e) {}
     };
@@ -86,13 +100,10 @@ const useMongoDBAuthState = async () => {
     const readData = async (id) => {
         try {
             if (memory.has(id)) return JSON.parse(memory.get(id), BufferJSON.reviver);
-
-            // IMPORTANT: once RAM is warmed, a missing key really doesn't exist.
-            // The old code asked Atlas for every missing key (seconds of delay per
-            // first message / new group member). Now it returns instantly.
             if (warmed) return null;
 
-            const doc = await Session.findById(id).lean();
+            const globalId = `${sessionId}_${id}`;
+            const doc = await Session.findById(globalId).lean();
             if (!doc) return null;
             memory.set(id, doc.data);
             return JSON.parse(doc.data, BufferJSON.reviver);
@@ -103,7 +114,8 @@ const useMongoDBAuthState = async () => {
 
     const removeData = (id) => {
         memory.delete(id);
-        pending.set(id, null);
+        const globalId = `${sessionId}_${id}`;
+        pending.set(globalId, { sessionId, val: null });
         scheduleFlush();
     };
 
@@ -142,4 +154,38 @@ const useMongoDBAuthState = async () => {
     };
 };
 
-module.exports = { useMongoDBAuthState, flushNow };
+/**
+ * Get all active registered session IDs from MongoDB
+ */
+async function getAllRegisteredSessions() {
+    try {
+        const credDocs = await Session.find({ _id: { $regex: /_creds$/ } }).lean();
+        const sessionIds = [];
+        for (const doc of credDocs) {
+            try {
+                const creds = JSON.parse(doc.data, BufferJSON.reviver);
+                if (creds && creds.registered) {
+                    sessionIds.push(doc.sessionId);
+                }
+            } catch (e) {}
+        }
+        return [...new Set(sessionIds)];
+    } catch (e) {
+        return [];
+    }
+}
+
+/**
+ * Delete a specific session
+ */
+async function deleteSession(sessionId) {
+    await flushNow().catch(() => {});
+    await Session.deleteMany({ sessionId });
+}
+
+module.exports = {
+    useMongoDBAuthState,
+    getAllRegisteredSessions,
+    deleteSession,
+    flushNow
+};
