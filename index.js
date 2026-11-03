@@ -29,7 +29,9 @@ const { loadPlugins, dispatchCommand } = require('./lib/handler');
 const app = express();
 const port = process.env.PORT || 8000;
 
-const msgRetryCounterCache = new NodeCache();
+// High-speed Baileys internal caches
+const msgRetryCounterCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+const userDevicesCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 const logger = pino({ level: 'silent' });
 
 app.use(express.json());
@@ -49,6 +51,7 @@ let sock = null;
 let sockId = 0;
 let connected = false;
 let pairBusy = false;
+let activePulse = null;
 
 async function connectDB() {
     if (mongoose.connection.readyState !== 1) {
@@ -62,6 +65,10 @@ async function connectDB() {
 function stopSock() {
     sockId++;
     connected = false;
+    if (activePulse) {
+        clearInterval(activePulse);
+        activePulse = null;
+    }
     if (sock) {
         try { sock.end(undefined); } catch (e) {}
         sock = null;
@@ -90,7 +97,7 @@ async function startSock({ allowUnregistered = false } = {}) {
 
     const { version } = await fetchLatestBaileysVersion();
 
-    // 24/7 Stable Socket Configuration
+    // 24/7 Ultra Fast Stable Socket
     const s = makeWASocket({
         version,
         logger,
@@ -99,14 +106,17 @@ async function startSock({ allowUnregistered = false } = {}) {
             keys: makeCacheableSignalKeyStore(state.keys, logger)
         },
         printQRInTerminal: false,
-        browser: Browsers.macOS('Chrome'),
+        browser: Browsers.macOS('Desktop'),
         syncFullHistory: false,
-        markOnlineOnConnect: true, // Online තබා ගැනීමෙන් WhatsApp සර්වර් drop වීම වළක්වයි
+        markOnlineOnConnect: true,
         generateHighQualityLinkPreview: false,
         msgRetryCounterCache,
+        userDevicesCache,
+        emitOwnEvents: false,
+        fireInitQueries: false,
         connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 30000, // නිවැරදි Ping Interval එක (WhatsApp Connection Drop නොවේ)
-        defaultQueryTimeoutMs: 60000 // Query Timeout එක 0 නොකර 60s තැබීම
+        keepAliveIntervalMs: 15000,
+        defaultQueryTimeoutMs: 60000
     });
     sock = s;
 
@@ -121,6 +131,17 @@ async function startSock({ allowUnregistered = false } = {}) {
             connected = true;
             console.log(chalk.green.bold('\n[✓] DARK DINU V1 IS ONLINE 24/7 ⚡\n'));
 
+            // Anti-Idle Stream Pulse (විනාඩි ගණනක් මැසේජ් නොආවත් WebSocket connection එක dormant වීම වළක්වයි)
+            if (activePulse) clearInterval(activePulse);
+            activePulse = setInterval(async () => {
+                if (connected && sock && id === sockId) {
+                    try {
+                        await sock.sendPresenceUpdate('available');
+                    } catch (e) {}
+                }
+            }, 25000);
+
+            // පළමු වතාවට Link වූ විට පමණක් Message එක යැවීම
             const alreadySent = settings.get('initialConnectSent');
             if (!alreadySent) {
                 const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
@@ -138,6 +159,11 @@ async function startSock({ allowUnregistered = false } = {}) {
 
         if (connection === 'close') {
             connected = false;
+            if (activePulse) {
+                clearInterval(activePulse);
+                activePulse = null;
+            }
+
             const code = lastDisconnect?.error?.output?.statusCode;
             console.log(chalk.red(`[!] Connection closed (code: ${code})`));
 
@@ -150,8 +176,7 @@ async function startSock({ allowUnregistered = false } = {}) {
 
             if (!state.creds.registered) return;
 
-            // Stable reconnect backoff (Loop එකට නොවැටී reconnect වේ)
-            const reconnectDelay = code === DisconnectReason.restartRequired ? 1500 : 4000;
+            const reconnectDelay = code === DisconnectReason.restartRequired ? 1000 : 3500;
             await delay(reconnectDelay);
             if (id !== sockId) return;
             startSock().catch((e) => console.error('[RECONNECT ERROR]:', e.message));
@@ -218,18 +243,15 @@ app.get('/pair', async (req, res) => {
     }
 });
 
-// ───────────── Render Auto Keep-Alive (24/7 Sleep Preventer) ─────────────
+// ───────────── Render Auto Keep-Alive ─────────────
 function startKeepAlive() {
-    // මිනිත්තු 4කට වරක් සර්වර් එකටම ping ගසා Render එක Sleep වීම නවත්වයි
     setInterval(() => {
         const renderUrl = process.env.RENDER_EXTERNAL_URL;
         if (renderUrl) {
             const client = renderUrl.startsWith('https') ? https : http;
-            client.get(`${renderUrl}/health`, (res) => {
-                // Keep-alive ping success
-            }).on('error', () => {});
+            client.get(`${renderUrl}/health`, () => {}).on('error', () => {});
         }
-    }, 4 * 60 * 1000);
+    }, 3 * 60 * 1000); // විනාඩි 3කට වරක් self-ping
 }
 
 // ───────────── Boot Sequence ─────────────
