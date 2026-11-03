@@ -37,11 +37,11 @@ async function flushNow() {
             : {
                   updateOne: {
                       filter: { _id: id },
-                      update: { 
-                          $set: { 
-                              data: item.val, 
-                              ...(item.sessionId ? { sessionId: item.sessionId } : {}) 
-                          } 
+                      update: {
+                          $set: {
+                              data: item.val,
+                              ...(item.sessionId ? { sessionId: item.sessionId } : {})
+                          }
                       },
                       upsert: true
                   }
@@ -68,6 +68,8 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     });
 }
 
+const hasLinked = (creds) => !!(creds && (creds.registered || creds.me));
+
 /**
  * Universal Multi-Session + Legacy Auth State Engine
  */
@@ -77,15 +79,19 @@ const useMongoDBAuthState = async (sessionId = 'default') => {
     const memory = new Map();
     let warmed = false;
     const isLegacy = (sessionId === 'legacy');
+    const prefix = `${sessionId}_`;
 
     try {
-        const query = isLegacy 
-            ? { $or: [{ sessionId: 'legacy' }, { sessionId: { $exists: false } }] } 
+        const query = isLegacy
+            ? { $or: [{ sessionId: 'legacy' }, { sessionId: { $exists: false } }] }
             : { sessionId };
 
         const existingDocs = await Session.find(query).lean();
         for (const doc of existingDocs) {
-            const localId = isLegacy ? doc._id : doc._id.replace(`${sessionId}_`, '');
+            // FIX: prefix එක ඉස්සරහින් විතරක් අයින් කරන්න (replace වලින් මැදින් අයින් වෙන්න පුළුවන්)
+            const localId = (!isLegacy && doc._id.startsWith(prefix))
+                ? doc._id.slice(prefix.length)
+                : doc._id;
             memory.set(localId, doc.data);
         }
         warmed = true;
@@ -93,14 +99,17 @@ const useMongoDBAuthState = async (sessionId = 'default') => {
         console.error(`[AUTH WARMUP ERROR - ${sessionId}]:`, err.message);
     }
 
+    const toGlobalId = (id) => (isLegacy ? id : `${prefix}${id}`);
+
     const writeData = (data, id) => {
         try {
             const val = JSON.stringify(data, BufferJSON.replacer);
             memory.set(id, val);
-            const globalId = isLegacy ? id : `${sessionId}_${id}`;
-            pending.set(globalId, { sessionId: isLegacy ? 'legacy' : sessionId, val });
+            pending.set(toGlobalId(id), { sessionId: isLegacy ? 'legacy' : sessionId, val });
             scheduleFlush();
-        } catch (e) {}
+        } catch (e) {
+            console.error(`[AUTH WRITE ERROR - ${sessionId}]:`, e.message);
+        }
     };
 
     const readData = async (id) => {
@@ -108,8 +117,7 @@ const useMongoDBAuthState = async (sessionId = 'default') => {
             if (memory.has(id)) return JSON.parse(memory.get(id), BufferJSON.reviver);
             if (warmed) return null;
 
-            const globalId = isLegacy ? id : `${sessionId}_${id}`;
-            const doc = await Session.findById(globalId).lean();
+            const doc = await Session.findById(toGlobalId(id)).lean();
             if (!doc) return null;
             memory.set(id, doc.data);
             return JSON.parse(doc.data, BufferJSON.reviver);
@@ -120,8 +128,7 @@ const useMongoDBAuthState = async (sessionId = 'default') => {
 
     const removeData = (id) => {
         memory.delete(id);
-        const globalId = isLegacy ? id : `${sessionId}_${id}`;
-        pending.set(globalId, { sessionId: isLegacy ? 'legacy' : sessionId, val: null });
+        pending.set(toGlobalId(id), { sessionId: isLegacy ? 'legacy' : sessionId, val: null });
         scheduleFlush();
     };
 
@@ -167,30 +174,29 @@ async function getAllRegisteredSessions() {
     try {
         const sessionIds = [];
 
-        // Check for legacy single-session
+        // Legacy single-session
         const legacyCredDoc = await Session.findById('creds').lean();
         if (legacyCredDoc) {
             try {
                 const creds = JSON.parse(legacyCredDoc.data, BufferJSON.reviver);
-                if (creds && creds.registered) {
-                    sessionIds.push('legacy');
-                }
+                if (hasLinked(creds)) sessionIds.push('legacy');
             } catch (e) {}
         }
 
-        // Check for multi-tenant sessions
+        // Multi-tenant sessions
         const multiCredDocs = await Session.find({ _id: { $regex: /_creds$/ } }).lean();
         for (const doc of multiCredDocs) {
             try {
                 const creds = JSON.parse(doc.data, BufferJSON.reviver);
-                if (creds && creds.registered && doc.sessionId) {
-                    sessionIds.push(doc.sessionId);
-                }
+                // FIX: sessionId field නැත්නම් _id එකෙන් ගන්න
+                const sid = doc.sessionId || doc._id.replace(/_creds$/, '');
+                if (hasLinked(creds) && sid) sessionIds.push(sid);
             } catch (e) {}
         }
 
         return [...new Set(sessionIds)];
     } catch (e) {
+        console.error('[SESSION SCAN ERROR]:', e.message);
         return [];
     }
 }
@@ -199,7 +205,13 @@ async function getAllRegisteredSessions() {
  * Delete session cleanly
  */
 async function deleteSession(sessionId) {
+    // FIX: delete කරන session එකේ pending writes අයින් කරන්න (නැත්නම් ආයෙ DB එකට ලියවෙනවා)
+    const sid = sessionId === 'legacy' ? 'legacy' : sessionId;
+    for (const [key, item] of pending.entries()) {
+        if (item.sessionId === sid) pending.delete(key);
+    }
     await flushNow().catch(() => {});
+
     if (sessionId === 'legacy') {
         await Session.deleteMany({ $or: [{ sessionId: 'legacy' }, { sessionId: { $exists: false } }] });
     } else {
