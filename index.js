@@ -1,350 +1,471 @@
 const dns = require('dns');
 try {
     dns.setDefaultResultOrder('ipv4first');
-    dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']);
+    if (process.env.CUSTOM_DNS !== '0') dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']);
 } catch (e) {}
 
 const express = require('express');
 const path = require('path');
 const https = require('https');
 const http = require('http');
+const baileys = require('@whiskeysockets/baileys');
 const {
-    default: makeWASocket,
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    delay,
-    makeCacheableSignalKeyStore,
-    Browsers
-} = require('@whiskeysockets/baileys');
+    default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore, Browsers
+} = baileys;
 const pino = require('pino');
 const mongoose = require('mongoose');
 const chalk = require('chalk');
 const NodeCache = require('node-cache');
 
 const config = require('./config');
-const {
-    useMongoDBAuthState,
-    getAllRegisteredSessions,
-    deleteSession
-} = require('./database/mongo');
+const { useMongoDBAuthState, getAllRegisteredSessions, deleteSession, isSessionLinked } = require('./database/mongo');
 const settings = require('./database/settings');
-const { loadPlugins, dispatchCommand } = require('./lib/handler');
+const store = require('./lib/store');
+const U = require('./lib/utils');
+const { loadPlugins, dispatch, emit } = require('./lib/handler');
 
 const app = express();
 const port = process.env.PORT || 8000;
+const logger = pino({ level: 'silent' });
+const delay = U.sleep;
 
 const msgRetryCounterCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 const userDevicesCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 const groupCache = new NodeCache({ stdTTL: 600, checkperiod: 120, useClones: false });
-const logger = pino({ level: 'silent' });
 
-// Crash වීම වළක්වන්න
+// Never let the process die
 process.on('unhandledRejection', (e) => console.error('[UNHANDLED REJECTION]:', e?.message || e));
 process.on('uncaughtException', (e) => console.error('[UNCAUGHT EXCEPTION]:', e?.message || e));
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+// ───────────── Session registry ─────────────
+const sessions = new Map();   // sid -> S (lives across reconnects)
+const pairingBusy = new Set();
 
-// ───────────── Multi-Session Registry ─────────────
-const sessions = new Map();
-const pairingInProgress = new Set();
-
-// FIX: pairing එකෙන් පස්සේ creds.registered true නොවෙන්න පුළුවන්, creds.me තියෙනවා නම් link වෙලා
 const isRegistered = (creds) => !!(creds && (creds.registered || creds.me));
+const mask = (id) => (id.length > 6 ? id.slice(0, 4) + '****' + id.slice(-2) : id);
+const backoff = (n) => Math.min(30000, 2000 * 2 ** Math.min(n, 4));
+
+function makeSession(sid) {
+    const S = {
+        id: sid,
+        number: sid === 'legacy' ? '' : sid,
+        config,
+        cfg: settings.forSession(sid),
+        sock: null, state: null,
+        gen: 0,
+        connected: false,
+        pairing: false,
+        starting: false,
+        replaced: false,
+        banned: false,
+        attempts: 0,
+        pingFails: 0,
+        lastChange: Date.now(),
+        selfJid: null,
+        timers: [],
+        reconnectTimer: null,
+        pairTimer: null,
+        waiters: [],
+        qrReady: false,
+        panelIds: [],
+        activeChats: new Map(),
+        callNotified: new Map(),
+        recent: new Set()
+    };
+    S.restart = () => restartSession(sid);
+    return S;
+}
 
 async function connectDB() {
     if (mongoose.connection.readyState !== 1) {
-        await mongoose.connect(config.MONGODB_URI, {
-            serverSelectionTimeoutMS: 15000,
-            family: 4
-        });
+        await mongoose.connect(config.MONGODB_URI, { serverSelectionTimeoutMS: 15000, family: 4 });
     }
 }
 
-function stopSession(sessionId) {
-    const session = sessions.get(sessionId);
-    if (session) {
-        session.sockId++;
-        session.connected = false;
-        if (session.activePulse) clearInterval(session.activePulse);
-        try { session.sock.end(undefined); } catch (e) {}
-        sessions.delete(sessionId);
+function teardown(S) {
+    S.gen++;                       // invalidates every handler of the old socket
+    S.connected = false;
+    S.qrReady = false;
+    for (const t of S.timers) clearInterval(t);
+    S.timers = [];
+    if (S.reconnectTimer) { clearTimeout(S.reconnectTimer); S.reconnectTimer = null; }
+    for (const w of S.waiters.splice(0)) w.reject(new Error('Socket closed'));
+    const s = S.sock;
+    S.sock = null;
+    if (s) {
+        try { s.ev.removeAllListeners('connection.update'); } catch (e) {}
+        try { s.end(undefined); } catch (e) {}
     }
 }
 
-// ───────────── Core Multi-Socket Launcher ─────────────
-async function startSession(sessionId, { allowUnregistered = false } = {}) {
+async function removeSession(sid) {
+    const S = sessions.get(sid);
+    if (S) {
+        teardown(S);
+        if (S.pairTimer) clearTimeout(S.pairTimer);
+        sessions.delete(sid);
+    }
+    store.clear(sid);
+    await deleteSession(sid).catch(() => {});
+}
+
+function scheduleReconnect(S, ms) {
+    if (S.reconnectTimer) clearTimeout(S.reconnectTimer);
+    S.reconnectTimer = setTimeout(async () => {
+        S.reconnectTimer = null;
+        if (S.connected || S.starting || S.replaced || S.banned) return;
+        try {
+            const r = await startSession(S.id);
+            if (!r) return;
+        } catch (e) {
+            S.attempts++;
+            console.error(chalk.yellow(`[RECONNECT ${S.id}] failed (${e.message}) – retry #${S.attempts}`));
+            scheduleReconnect(S, backoff(S.attempts));
+        }
+    }, ms);
+}
+
+async function restartSession(sid) {
+    const S = sessions.get(sid);
+    if (!S) return;
+    S.replaced = false;
+    S.attempts = 0;
+    teardown(S);
+    scheduleReconnect(S, 800);
+}
+
+// ───────────── Socket launcher ─────────────
+async function startSession(sid, { allowUnregistered = false } = {}) {
     await connectDB();
+    await settings.load(sid);
 
-    const { state, saveCreds } = await useMongoDBAuthState(sessionId);
+    let S = sessions.get(sid);
+    if (!S) { S = makeSession(sid); sessions.set(sid, S); }
+    if (S.starting) return S;
+    S.starting = true;
 
-    if (!isRegistered(state.creds) && !allowUnregistered) {
-        return null;
-    }
-
-    stopSession(sessionId);
-
-    let sessionObj = {
-        sock: null,
-        sockId: 1,
-        connected: false,
-        activePulse: null
-    };
-    sessions.set(sessionId, sessionObj);
-    const id = sessionObj.sockId;
-
-    let version;
     try {
-        const latest = await Promise.race([
-            fetchLatestBaileysVersion(),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))
-        ]);
-        version = latest.version;
-    } catch (e) {}
-
-    const socketConfig = {
-        logger,
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, logger)
-        },
-        printQRInTerminal: false,
-        // FIX: pairing code සඳහා Chrome browser signature අවශ්‍යයි
-        browser: Browsers.ubuntu('Chrome'),
-        syncFullHistory: false,
-        shouldSyncHistoryMessage: () => false,
-        shouldIgnoreJid: (jid) => !!jid && (jid.endsWith('@broadcast') || jid.endsWith('@newsletter')),
-        cachedGroupMetadata: async (jid) => groupCache.get(jid),
-        markOnlineOnConnect: true,
-        generateHighQualityLinkPreview: false,
-        msgRetryCounterCache,
-        userDevicesCache,
-        emitOwnEvents: false,
-        connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 15000,
-        defaultQueryTimeoutMs: 60000
-    };
-    // FIX: version undefined නම් default version overwrite වෙනවා -> connect වෙන්නේ නෑ
-    if (version) socketConfig.version = version;
-
-    const s = makeWASocket(socketConfig);
-
-    sessionObj.sock = s;
-
-    s.getGroupMeta = async (jid) => {
-        let meta = groupCache.get(jid);
-        if (!meta) {
-            meta = await s.groupMetadata(jid);
-            groupCache.set(jid, meta);
+        const { state, saveCreds } = await useMongoDBAuthState(sid);
+        if (!isRegistered(state.creds) && !allowUnregistered) {
+            sessions.delete(sid);
+            return null;
         }
-        return meta;
-    };
 
-    s.ev.on('creds.update', saveCreds);
+        teardown(S);
+        const gen = S.gen;
+        S.state = state;
+        S.lastChange = Date.now();
+        if (state.creds.me?.id) { S.number = U.jidNum(state.creds.me.id); S.selfJid = U.normJid(state.creds.me.id); }
 
-    s.ev.on('connection.update', async (update) => {
-        if (sessionObj.sockId !== id) return;
+        let version;
+        try {
+            const latest = await Promise.race([
+                fetchLatestBaileysVersion(),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))
+            ]);
+            version = latest.version;
+        } catch (e) {}
 
-        const { connection, lastDisconnect } = update;
+        const sock = makeWASocket({
+            ...(version ? { version } : {}),
+            logger,
+            auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
+            printQRInTerminal: false,
+            browser: Browsers.ubuntu('Chrome'),
+            syncFullHistory: false,
+            shouldSyncHistoryMessage: () => false,
+            // NOTE: status@broadcast must NOT be ignored (status seen / react / save need it)
+            shouldIgnoreJid: (jid) => !!jid && jid !== 'status@broadcast' && (jid.endsWith('@broadcast') || jid.endsWith('@newsletter')),
+            cachedGroupMetadata: async (jid) => groupCache.get(jid),
+            getMessage: async (key) => store.find(sid, key.id)?.message,
+            markOnlineOnConnect: S.cfg.get('online') === 'on',
+            generateHighQualityLinkPreview: false,
+            msgRetryCounterCache,
+            userDevicesCache,
+            emitOwnEvents: false,
+            qrTimeout: 120000,
+            connectTimeoutMs: 60000,
+            keepAliveIntervalMs: 15000,
+            defaultQueryTimeoutMs: 60000,
+            retryRequestDelayMs: 250
+        });
+        S.sock = sock;
 
-        if (connection === 'open') {
-            sessionObj.connected = true;
-            console.log(chalk.green.bold(`\n[✓] BOT ONLINE: ${sessionId} ⚡\n`));
+        sock.getGroupMeta = async (jid) => {
+            let meta = groupCache.get(jid);
+            if (!meta) { meta = await sock.groupMetadata(jid); groupCache.set(jid, meta); }
+            return meta;
+        };
 
-            s.groupFetchAllParticipating()
-                .then((all) => { for (const jid in all) groupCache.set(jid, all[jid]); })
-                .catch(() => {});
+        sock.ev.on('creds.update', saveCreds);
 
-            if (sessionObj.activePulse) clearInterval(sessionObj.activePulse);
-            sessionObj.activePulse = setInterval(async () => {
-                if (sessionObj.connected && s && sessionObj.sockId === id) {
-                    try { await s.sendPresenceUpdate('available'); } catch (e) {}
+        sock.ev.on('connection.update', async (update) => {
+            if (S.gen !== gen) return;
+            const { connection, lastDisconnect, qr } = update;
+
+            if (qr) {
+                S.qrReady = true;
+                for (const w of S.waiters.splice(0)) w.resolve();
+            }
+
+            if (connection === 'open') {
+                S.connected = true;
+                S.attempts = 0;
+                S.pingFails = 0;
+                S.pairing = false;
+                S.lastChange = Date.now();
+                S.selfJid = U.normJid(sock.user.id);
+                S.number = U.jidNum(sock.user.id);
+                console.log(chalk.green.bold(`\n[✓] BOT ONLINE: ${S.number} ⚡\n`));
+
+                setTimeout(() => {
+                    if (S.gen !== gen) return;
+                    sock.groupFetchAllParticipating()
+                        .then((all) => { for (const j in all) groupCache.set(j, all[j]); })
+                        .catch(() => {});
+                }, 4000);
+
+                // every 20s: always-online / fake presence tasks
+                S.timers.push(setInterval(() => {
+                    if (S.connected && S.gen === gen) emit('tick', S, null).catch(() => {});
+                }, 20000));
+
+                // every 60s: real ping – if the socket is half-dead, reconnect immediately
+                S.timers.push(setInterval(async () => {
+                    if (!S.connected || S.gen !== gen) return;
+                    try {
+                        await sock.query({ tag: 'iq', attrs: { to: '@s.whatsapp.net', type: 'get', xmlns: 'w:p' }, content: [{ tag: 'ping', attrs: {} }] }, 20000);
+                        S.pingFails = 0;
+                    } catch (e) {
+                        S.pingFails++;
+                        console.log(chalk.yellow(`[PING ${S.number}] failed (${S.pingFails})`));
+                        if (S.pingFails >= 2) restartSession(sid);
+                    }
+                }, 60000));
+
+                emit('tick', S, null).catch(() => {});
+
+                if (!S.cfg.get('welcomeSent')) {
+                    await S.cfg.set('welcomeSent', true);
+                    sock.sendMessage(S.selfJid, {
+                        text: `⚡ *${config.BOT_NAME} IS ONLINE* ⚡\n\n📱 *Account:* +${S.number}\n🛡️ *Status:* Connected 24/7\n\n` +
+                              `💡 *${S.cfg.get('prefix')}menu* – commands\n💡 *${S.cfg.get('prefix')}setting* – control panel\n\n${config.FOOTER}`
+                    }).catch(() => {});
                 }
-            }, 25000);
-
-            const alertKey = `initialSent_${sessionId}`;
-            const alreadySent = settings.get(alertKey);
-            if (!alreadySent) {
-                const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
-                await s.sendMessage(ownerJid, {
-                    text: `⚡ *DARK DINU V1 IS ONLINE* ⚡\n\n` +
-                          `📱 *Account:* ${sessionId}\n` +
-                          `🛡️ *Status:* Connected Successfully\n` +
-                          `👑 *Developer:* 94719845166`
-                }).catch(() => {});
-                await settings.set(alertKey, true);
-            }
-        }
-
-        if (connection === 'close') {
-            sessionObj.connected = false;
-            if (sessionObj.activePulse) {
-                clearInterval(sessionObj.activePulse);
-                sessionObj.activePulse = null;
             }
 
-            const code = lastDisconnect?.error?.output?.statusCode;
-            console.log(chalk.red(`[!] Session ${sessionId} closed (code: ${code})`));
+            if (connection === 'close') {
+                S.connected = false;
+                S.lastChange = Date.now();
+                for (const t of S.timers) clearInterval(t);
+                S.timers = [];
+                for (const w of S.waiters.splice(0)) w.reject(new Error('Connection closed before ready'));
 
-            if (code === DisconnectReason.loggedOut) {
-                console.log(chalk.red(`[!] Session ${sessionId} logged out. Cleaning data.`));
-                stopSession(sessionId);
-                await deleteSession(sessionId).catch(() => {});
-                return;
+                const code = lastDisconnect?.error?.output?.statusCode;
+                console.log(chalk.red(`[!] Session ${mask(sid)} closed (code: ${code})`));
+
+                if (code === DisconnectReason.loggedOut) {
+                    console.log(chalk.red(`[!] ${mask(sid)} logged out – cleaning data.`));
+                    await removeSession(sid);
+                    return;
+                }
+                if (code === DisconnectReason.connectionReplaced) {
+                    S.replaced = true;
+                    console.log(chalk.red(`[!] ${mask(sid)} was opened somewhere else (another server using the same DB?). Not reconnecting. Use .restart or redeploy to resume.`));
+                    return;
+                }
+                if (code === DisconnectReason.forbidden) {
+                    S.banned = true;
+                    console.log(chalk.red(`[!] ${mask(sid)} forbidden (403). Stopped.`));
+                    return;
+                }
+                if (!isRegistered(state.creds)) return;   // still pairing
+
+                S.attempts++;
+                scheduleReconnect(S, code === DisconnectReason.restartRequired ? 800 : backoff(S.attempts));
             }
+        });
 
-            // FIX: pairing සාර්ථක වුණාම WhatsApp 515 (restartRequired) දෙනවා.
-            // creds.me තියෙනවා නම් reconnect කරන්න ඕන.
-            if (!isRegistered(state.creds)) return;
+        sock.ev.on('messages.upsert', ({ messages, type }) => {
+            if (S.gen !== gen) return;
+            for (const raw of messages) {
+                if (!raw || !raw.message || !raw.key) continue;
+                if (type !== 'notify') {
+                    // 'append' = history / offline sync: only process very fresh messages
+                    const ts = Number(raw.messageTimestamp?.toNumber ? raw.messageTimestamp.toNumber() : raw.messageTimestamp) || 0;
+                    if (Date.now() / 1000 - ts > 20) continue;
+                }
+                const uid = `${raw.key.remoteJid}|${raw.key.id}`;
+                if (S.recent.has(uid)) continue;
+                S.recent.add(uid);
+                if (S.recent.size > 800) S.recent.delete(S.recent.values().next().value);
 
-            const reconnectDelay = code === DisconnectReason.restartRequired ? 1000 : 3500;
-            await delay(reconnectDelay);
-            if (sessionObj.sockId !== id) return;
-            startSession(sessionId).catch((e) => console.error(`[RECONNECT ERROR ${sessionId}]:`, e.message));
-        }
-    });
+                dispatch(S, raw).catch((e) => console.error(`[DISPATCH ${mask(sid)}]:`, e.message));
+            }
+        });
 
-    s.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (sessionObj.sockId !== id) return;
-        if (type !== 'notify') return;
+        sock.ev.on('call', (calls) => {
+            if (S.gen !== gen) return;
+            for (const c of calls) emit('call', S, c).catch(() => {});
+        });
 
-        for (const m of messages) {
-            if (!m || !m.message) continue;
-            if (m.key?.remoteJid === 'status@broadcast') continue;
-            dispatchCommand(s, m, config, settings).catch((e) =>
-                console.error(`[CMD ERROR ${sessionId}]:`, e.message)
-            );
-        }
-    });
+        sock.ev.on('groups.update', (u) => { for (const g of u) if (g.id) groupCache.del(g.id); });
+        sock.ev.on('group-participants.update', (u) => { if (u?.id) groupCache.del(u.id); });
 
-    return { sock: s, state };
+        return S;
+    } finally {
+        S.starting = false;
+    }
 }
 
-// ───────────── Web Multi-Device API ─────────────
-app.get('/status', (req, res) => {
-    const list = [];
-    for (const [id, s] of sessions.entries()) {
-        list.push({ phone: id, connected: s.connected });
+// ───────────── Watchdog: any dead session gets revived ─────────────
+setInterval(() => {
+    for (const S of sessions.values()) {
+        if (S.connected || S.pairing || S.starting || S.replaced || S.banned || S.reconnectTimer) continue;
+        if (!isRegistered(S.state?.creds)) continue;
+        if (Date.now() - S.lastChange < 90000) continue;
+        console.log(chalk.yellow(`[WATCHDOG] reviving ${mask(S.id)}`));
+        S.lastChange = Date.now();
+        scheduleReconnect(S, 500);
     }
-    res.json({
-        total: sessions.size,
-        active: list.filter(x => x.connected).length,
-        devices: list
-    });
-});
+}, 45000);
 
+// ───────────── Web API ─────────────
 app.get('/health', (req, res) => {
-    res.status(200).json({
-        status: 'active',
-        totalBots: sessions.size
-    });
+    res.status(200).json({ status: 'active', uptime: Math.floor(process.uptime()), bots: sessions.size });
+});
+app.get('/ping', (req, res) => res.send('pong'));
+
+// /status            -> counts only (numbers are NOT exposed)
+// /status?phone=947… -> { connected } for that number (used by the link page)
+app.get('/status', (req, res) => {
+    const phone = String(req.query.phone || '').replace(/\D/g, '');
+    if (phone) {
+        const S = sessions.get(phone);
+        return res.json({ connected: !!(S && S.connected) });
+    }
+    let active = 0;
+    for (const S of sessions.values()) if (S.connected) active++;
+    res.json({ total: sessions.size, active });
 });
 
-// Pairing Code Route (retry සමඟ)
+function waitReady(S, ms) {
+    return new Promise((resolve, reject) => {
+        if (S.qrReady) return resolve();
+        const t = setTimeout(() => reject(new Error('WhatsApp connection timeout')), ms);
+        S.waiters.push({
+            resolve: () => { clearTimeout(t); resolve(); },
+            reject: (e) => { clearTimeout(t); reject(e); }
+        });
+    });
+}
+
 app.get('/pair', async (req, res) => {
-    const phone = String(req.query.phone || '').replace(/[^0-9]/g, '');
-
+    const phone = String(req.query.phone || '').replace(/\D/g, '');
     if (phone.length < 8 || phone.length > 15) {
-        return res.status(400).json({ error: 'Please enter a valid number with country code.' });
+        return res.status(400).json({ error: 'Country code එක්ක නිවැරදි number එකක් දෙන්න.' });
     }
-    if (mongoose.connection.readyState !== 1) {
-        return res.status(503).json({ error: 'Database is not connected.' });
+    if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'Database එක connect වෙලා නෑ. තත්පර 10කින් try කරන්න.' });
+    if (pairingBusy.has(phone)) return res.status(429).json({ error: 'Pairing දැනටමත් පියවරේ. තත්පර 10ක් ඉන්න.' });
+
+    const existing = sessions.get(phone);
+    if (existing && existing.connected) {
+        return res.status(409).json({ error: 'මේ number එක දැනටමත් link වෙලා, bot active.' });
+    }
+    if (!existing && sessions.size >= config.MAX_SESSIONS) {
+        return res.status(403).json({ error: `Bot limit (${config.MAX_SESSIONS}) අවසන්.` });
     }
 
-    if (pairingInProgress.has(phone)) {
-        return res.status(429).json({ error: 'Pairing already in progress. Please wait 10 seconds.' });
-    }
-
-    pairingInProgress.add(phone);
+    pairingBusy.add(phone);
     try {
-        stopSession(phone);
-        await deleteSession(phone).catch(() => {});
+        // already linked but offline -> never wipe it, just bring it back
+        if (await isSessionLinked(phone)) {
+            startSession(phone).catch(() => {});
+            return res.status(409).json({
+                error: 'මේ number එක කලින් link කරලා. Bot start වෙනවා. WhatsApp එකෙන් Linked Devices අයින් කරලා නම් තත්පර 30කින් ආයෙ try කරන්න.'
+            });
+        }
 
-        let code = null;
-        let lastErr = null;
+        await removeSession(phone);
 
+        let code = null, lastErr = null;
         for (let attempt = 1; attempt <= 3 && !code; attempt++) {
             try {
-                const result = await startSession(phone, { allowUnregistered: true });
-                if (!result || !result.sock) throw new Error('Could not initiate connection.');
-
-                // WebSocket handshake සූදානම් වීමට රැඳී සිටීම
-                await delay(4000);
-
-                if (isRegistered(result.sock.authState.creds)) {
-                    return res.status(409).json({ error: 'This phone number is already registered.' });
-                }
-
-                code = await result.sock.requestPairingCode(phone);
+                const S = await startSession(phone, { allowUnregistered: true });
+                if (!S) throw new Error('Could not start connection.');
+                S.pairing = true;
+                await waitReady(S, 25000);            // handshake finished -> safe to ask for a code
+                code = await S.sock.requestPairingCode(phone);
+                S.pairTimer = setTimeout(async () => {  // never linked within 4 min -> free resources
+                    const cur = sessions.get(phone);
+                    if (cur && !isRegistered(cur.state?.creds)) await removeSession(phone);
+                }, 4 * 60 * 1000);
             } catch (e) {
                 lastErr = e;
-                console.error(chalk.yellow(`[PAIR RETRY ${phone}] attempt ${attempt}: ${e.message}`));
-                stopSession(phone);
+                console.error(chalk.yellow(`[PAIR RETRY ${mask(phone)}] attempt ${attempt}: ${e.message}`));
+                await removeSession(phone);
                 await delay(2000);
             }
         }
-
         if (!code) throw lastErr || new Error('Pairing failed.');
 
         const formatted = code.match(/.{1,4}/g)?.join('-') || code;
-        console.log(chalk.cyan(`[PAIRING] New session code for ${phone}: ${formatted}`));
-
+        console.log(chalk.cyan(`[PAIRING] code for ${mask(phone)}: ${formatted}`));
         return res.json({ code: formatted, phone });
     } catch (err) {
-        console.error(chalk.red(`[PAIR ERROR ${phone}]:`), err);
-        stopSession(phone);
-        return res.status(500).json({ error: err.message || 'Pairing failed. Try again.' });
+        console.error(chalk.red(`[PAIR ERROR ${mask(phone)}]:`), err.message);
+        await removeSession(phone);
+        return res.status(500).json({ error: (err.message || 'Pairing failed') + ' – ආයෙ try කරන්න.' });
     } finally {
-        pairingInProgress.delete(phone);
+        pairingBusy.delete(phone);
     }
 });
 
-// ───────────── Render Auto Keep-Alive ─────────────
+// ───────────── Keep-alive (stops Render/Koyeb/Railway free plans sleeping) ─────────────
 function startKeepAlive() {
-    setInterval(() => {
-        const renderUrl = process.env.RENDER_EXTERNAL_URL;
-        if (renderUrl) {
-            const client = renderUrl.startsWith('https') ? https : http;
-            client.get(`${renderUrl}/health`, () => {}).on('error', () => {});
-        }
-    }, 3 * 60 * 1000);
+    const url = config.APP_URL;
+    if (!url) {
+        console.log(chalk.yellow('[KEEPALIVE] APP_URL / RENDER_EXTERNAL_URL not set. Use UptimeRobot / cron-job.org to ping /health every 5 min.'));
+        return;
+    }
+    const client = url.startsWith('https') ? https : http;
+    setInterval(() => client.get(`${url.replace(/\/$/, '')}/health`, (r) => r.resume()).on('error', () => {}), 4 * 60 * 1000);
+    console.log(chalk.green(`[KEEPALIVE] self-ping every 4 min -> ${url}`));
 }
 
-// ───────────── Boot Sequence ─────────────
+// ───────────── Boot ─────────────
 (async () => {
     app.listen(port, () => {
-        console.log(chalk.green(`[SERVER] Multi-Device Hub Live on port ${port}`));
+        console.log(chalk.green(`[SERVER] DARK-DINU hub live on port ${port}`));
         startKeepAlive();
     });
 
     while (true) {
         try {
-            await mongoose.connect(config.MONGODB_URI, {
-                serverSelectionTimeoutMS: 15000,
-                family: 4
-            });
-            console.log(chalk.green('[DB] MongoDB connected successfully'));
+            await connectDB();
+            console.log(chalk.green('[DB] MongoDB connected'));
             break;
         } catch (err) {
-            console.error(chalk.red('[DB ERROR]:'), err.message, '- retrying in 8s');
+            console.error(chalk.red('[DB ERROR]:'), err.message, '- retry in 8s');
             await delay(8000);
         }
     }
 
+    loadPlugins();
+
     try {
-        await settings.initSettings();
-        loadPlugins();
-
-        const savedSessions = await getAllRegisteredSessions();
-        console.log(chalk.cyan(`[BOOT] Found ${savedSessions.length} registered WhatsApp session(s). Starting...`));
-
-        for (const sessionId of savedSessions) {
-            startSession(sessionId).catch((err) => {
-                console.error(`[BOOT ERROR ${sessionId}]:`, err.message);
+        const saved = await getAllRegisteredSessions();
+        console.log(chalk.cyan(`[BOOT] ${saved.length} registered session(s) found. Starting...`));
+        for (const sid of saved.slice(0, config.MAX_SESSIONS)) {
+            startSession(sid).catch((e) => {
+                console.error(`[BOOT ${mask(sid)}]:`, e.message);
+                const S = sessions.get(sid);
+                if (S) scheduleReconnect(S, 5000);
             });
             await delay(1500);
         }
