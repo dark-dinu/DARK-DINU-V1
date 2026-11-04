@@ -228,11 +228,12 @@ function renderCode(code){
   const t = $('timerBar'); t.style.animation='none'; void t.offsetWidth; t.style.animation='';
 }
 
+let currentPhone = '';
 function startPolling(){
   stopPolling();
   poll = setInterval(async ()=>{
     try{
-      const r = await fetch('/status'); const d = await r.json();
+      const r = await fetch('/status?phone=' + currentPhone); const d = await r.json();
       if(d.connected){ stopPolling(); setStep(3); }
     }catch(e){}
   }, 2000);
@@ -251,7 +252,7 @@ async function generate(){
     const res = await fetch('/pair?phone=' + num);
     const data = await res.json();
     if(!res.ok || !data.code) throw new Error(data.error || 'Could not generate a code. Try again.');
-    currentCode = data.code;
+    currentCode = data.code; currentPhone = num;
     renderCode(currentCode);
     setStep(2);
     startPolling();
