@@ -1,114 +1,70 @@
-const { cmd } = require('../lib/handler');
-const fs = require('fs');
-const path = require('path');
+// .setting panel + reply-to-change + shortcut commands (.antidelete on, .mode private ...)
+const { cmd, on } = require('../lib/handler');
+const { SECTIONS, buildPanel, applyCodes, applyWord } = require('../lib/panel');
 
-// ⚡ Startup Memory Cache for Logo.png (Instant Response)
-let cachedLogo = null;
-const possiblePaths = [
-    path.join(__dirname, '../Logo.png'),
-    path.join(__dirname, '../logo.png'),
-    path.join(__dirname, '../assets/Logo.png'),
-    path.join(__dirname, '../assets/logo.png')
-];
-
-for (const p of possiblePaths) {
-    if (fs.existsSync(p)) {
-        try {
-            cachedLogo = fs.readFileSync(p);
-            break;
-        } catch (e) {}
-    }
+function rememberPanel(S, id) {
+    if (!id) return;
+    S.panelIds.push(id);
+    while (S.panelIds.length > 30) S.panelIds.shift();
 }
 
 cmd({
     pattern: 'setting',
-    alias: ['settings', 'set', 'config'],
-    desc: 'Manage bot status, mode, prefix & features',
-    category: 'owner',
-    fromMe: true,
-    react: '⚙️'
-}, async (sock, m, { args, text }, config, settings) => {
-    const input = text ? text.trim() : '';
-    const type = args[0]?.toLowerCase();
-    const val = args[1]?.toLowerCase();
+    alias: ['settings', 'config', 'panel', 'set'],
+    desc: 'Open the control panel (reply with 1.1, 4.2 ...)',
+    category: 'settings',
+    owner: true,
+    react: '🎛️'
+}, async (sock, m, { S }) => {
+    const sent = await sock.sendMessage(m.jid, { text: buildPanel(S) }, { quoted: m.raw });
+    rememberPanel(S, sent?.key?.id);
+});
 
-    // ──────── 1. අංක මඟින් (Quick Toggle Menu) ────────
-    // 1.1 Toggle Auto Status Read
-    if (input === '1.1') {
-        const current = settings.get('auto_status_read');
-        const next = !current;
-        await settings.set('auto_status_read', next);
-        return m.reply(`*Auto Status Seen:* \`${next ? 'ENABLED [ON] ✅' : 'DISABLED [OFF] ❌'}\``);
-    }
+// Owner replies to the panel with "1.1" / "4.2" / "10.6 🔥"
+on({ on: 'message' }, async (sock, m, S) => {
+    if (!m.isOwner || !m.quoted || !m.body) return;
+    if (!S.panelIds.includes(m.quoted.id)) return;
 
-    // 1.2 Toggle Auto Status React
-    if (input === '1.2') {
-        const current = settings.get('auto_status_react');
-        const next = !current;
-        await settings.set('auto_status_react', next);
-        return m.reply(`*Auto Status React:* \`${next ? 'ENABLED [ON] ✅' : 'DISABLED [OFF] ❌'}\``);
-    }
+    const r = await applyCodes(S, m.body);
+    if (!r.found) return;
 
-    // 1.3 Change React Emoji Guide
-    if (input === '1.3') {
-        const current = settings.get('status_react_emoji') || '❤️';
-        return m.reply(`*Status React Emoji Setup*\n\n▸ *Current Emoji:* ${current}\n▸ *To Change:* Type \`.streact <emoji>\`\n*Example:* \`.streact 🔥\``);
-    }
+    m.react(r.errors.length && !r.changes.length ? '❌' : '✅').catch(() => {});
+    const sent = await sock.sendMessage(
+        m.jid,
+        { text: buildPanel(S, [...r.changes, ...r.errors].join('\n')) },
+        { quoted: m.raw }
+    );
+    rememberPanel(S, sent?.key?.id);
+});
 
-    // 1.4 Toggle Work Mode (Public / Private)
-    if (input === '1.4') {
-        const current = settings.get('mode') || config.WORK_TYPE || 'public';
-        const next = current === 'public' ? 'private' : 'public';
-        await settings.set('mode', next);
-        return m.reply(`*Bot Work Mode:* \`${next.toUpperCase()} 🔒\``);
-    }
+// One shortcut command per panel section
+for (const sec of SECTIONS) {
+    cmd({
+        pattern: sec.command,
+        alias: sec.aliases,
+        desc: `${sec.name} (${sec.options.filter((o) => !o.custom).flatMap((o) => (o.words || [])[0] || []).join('/') || 'emoji'})`,
+        category: 'settings',
+        owner: true,
+        react: '⚙️'
+    }, async (sock, m, { S, text, prefix }) => {
+        if (!text) {
+            const cur = sec.show(S.cfg.get(sec.key));
+            return m.reply(`⚙️ *${sec.name}:* ${cur}\n\nවෙනස් කරන්න: \`${prefix}${sec.command} <value>\`\nහෝ \`${prefix}setting\` panel එක use කරන්න.`);
+        }
+        const r = await applyWord(S, sec, text);
+        return m.reply(r.msg);
+    });
+}
 
-    // ──────── 2. Direct Commands (.set / .setting prefix/mode) ────────
-    if (type === 'prefix' && args[1]) {
-        const newPrefix = args[1].trim();
-        await settings.set('prefix', newPrefix);
-        return m.reply(`✅ *Prefix updated to:* \`${newPrefix}\``);
-    }
-
-    if (type === 'mode' && (val === 'public' || val === 'private')) {
-        await settings.set('mode', val);
-        return m.reply(`✅ *Bot mode changed to:* \`${val.toUpperCase()}\``);
-    }
-
-    // ──────── 3. Settings Dashboard Menu ────────
-    const stRead = settings.get('auto_status_read') ? 'ON 🟢' : 'OFF 🔴';
-    const stReact = settings.get('auto_status_react') ? 'ON 🟢' : 'OFF 🔴';
-    const stEmoji = settings.get('status_react_emoji') || '❤️';
-    const currentMode = (settings.get('mode') || config.WORK_TYPE || 'public').toUpperCase();
-    const currentPrefix = settings.get('prefix') || config.DEFAULT_PREFIX || '.';
-
-    const menu = `*╭━━〔 DARK DINU SETTINGS ⚙️ 〕━━╮*
-┃
-┃ *[1.1]* Auto Status Read ➔ \`${stRead}\`
-┃ *[1.2]* Auto Status React ➔ \`${stReact}\`
-┃ *[1.3]* Status React Emoji ➔ \`${stEmoji}\`
-┃ *[1.4]* Work Mode ➔ \`${currentMode}\`
-┃ *[1.5]* Current Prefix ➔ \`${currentPrefix}\`
-┃
-*╰━━━━━━━━━━━━━━━━━━━━╯*
-
-*To change a setting, reply or type:*
-▸ \`.setting 1.1\` _(Toggle Status Seen)_
-▸ \`.setting 1.2\` _(Toggle Status React)_
-▸ \`.setting 1.4\` _(Toggle Public / Private)_
-▸ \`.streact <emoji>\` _(Change Emoji)_
-▸ \`.setting prefix <symbol>\` _(e.g: .setting prefix !)_
-▸ \`.setting mode <public/private>\`
-
-> *◉ ᴅᴇᴠ ʜᴇꜱʜᴀɴ ᴏꜰᴄ ◉*`;
-
-    // Send Image with Caption
-    if (cachedLogo) {
-        await sock.sendMessage(m.jid, {
-            image: cachedLogo,
-            caption: menu
-        }, { quoted: m });
-    } else {
-        await sock.sendMessage(m.jid, { text: menu }, { quoted: m });
-    }
+cmd({
+    pattern: 'prefix',
+    alias: ['setprefix'],
+    desc: 'Change command prefix',
+    category: 'settings',
+    owner: true
+}, async (sock, m, { S, text, prefix }) => {
+    const p = text.trim();
+    if (!p || p.length > 3 || /\s/.test(p)) return m.reply(`❌ භාවිතය: \`${prefix}prefix !\` (අකුරු 1-3ක් ඇතුළත)`);
+    await S.cfg.set('prefix', p);
+    return m.reply(`✅ Prefix ➜ \`${p}\``);
 });
