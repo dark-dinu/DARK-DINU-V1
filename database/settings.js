@@ -1,27 +1,53 @@
+// Per-session settings (every linked number has its own panel settings)
 const mongoose = require('mongoose');
 const config = require('../config');
+const DEFAULTS = require('../data/defaults');
 
-const SettingsSchema = new mongoose.Schema({
+const SettingModel = mongoose.models.BotSetting || mongoose.model('BotSetting', new mongoose.Schema({
     key: { type: String, required: true, unique: true },
     value: { type: mongoose.Schema.Types.Mixed, required: true }
-});
+}));
 
-const SettingModel = mongoose.model('BotSetting', SettingsSchema);
-const localCache = new Map();
+const cache = new Map(); // sid -> settings object
+const baseDefaults = () => ({ ...DEFAULTS, prefix: config.DEFAULT_PREFIX || '.', mode: config.WORK_TYPE || 'public' });
 
-module.exports = {
-    initSettings: async () => {
-        const all = await SettingModel.find({});
-        for (const item of all) {
-            localCache.set(item.key, item.value);
-        }
-        if (!localCache.has('prefix')) localCache.set('prefix', config.DEFAULT_PREFIX);
-        if (!localCache.has('mode')) localCache.set('mode', config.WORK_TYPE);
-        if (!localCache.has('antiDelete')) localCache.set('antiDelete', 'off');
-    },
-    get: (key) => localCache.get(key),
-    set: async (key, value) => {
-        localCache.set(key, value);
-        await SettingModel.findOneAndUpdate({ key }, { value }, { upsert: true });
+async function load(sid) {
+    if (cache.has(sid)) return cache.get(sid);
+    let saved = {};
+    try {
+        const doc = await SettingModel.findOne({ key: `cfg:${sid}` }).lean();
+        if (doc && doc.value) saved = doc.value;
+    } catch (e) {
+        console.error(`[SETTINGS LOAD ${sid}]:`, e.message);
     }
-};
+    const obj = { ...baseDefaults(), ...saved };
+    cache.set(sid, obj);
+    return obj;
+}
+
+async function persist(sid) {
+    try {
+        await SettingModel.findOneAndUpdate({ key: `cfg:${sid}` }, { value: cache.get(sid) }, { upsert: true });
+    } catch (e) {
+        console.error(`[SETTINGS SAVE ${sid}]:`, e.message);
+    }
+}
+
+function forSession(sid) {
+    return {
+        get: (k) => (cache.get(sid) || baseDefaults())[k],
+        set: async (k, v) => {
+            if (!cache.has(sid)) cache.set(sid, baseDefaults());
+            cache.get(sid)[k] = v;
+            await persist(sid);
+        },
+        all: () => ({ ...(cache.get(sid) || baseDefaults()) })
+    };
+}
+
+async function remove(sid) {
+    cache.delete(sid);
+    await SettingModel.deleteOne({ key: `cfg:${sid}` }).catch(() => {});
+}
+
+module.exports = { load, forSession, remove };
