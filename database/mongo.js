@@ -219,7 +219,22 @@ async function deleteSession(sessionId) {
     }
 }
 
+/**
+ * Is this session already linked to a WhatsApp account?
+ */
+async function isSessionLinked(sessionId) {
+    try {
+        await flushNow().catch(() => {});
+        const doc = await Session.findById(sessionId === 'legacy' ? 'creds' : `${sessionId}_creds`).lean();
+        if (!doc) return false;
+        return hasLinked(JSON.parse(doc.data, BufferJSON.reviver));
+    } catch (e) {
+        return false;
+    }
+}
+
 module.exports = {
+    isSessionLinked,
     useMongoDBAuthState,
     getAllRegisteredSessions,
     deleteSession,
